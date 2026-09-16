@@ -82,12 +82,14 @@ def build_prompt(hyp, brief_text, slice_timeout_s):
     )
 
 
-def invoke_opencode(prompt, cwd, config_content, timeout_s, model=None):
+def invoke_opencode(prompt, cwd, config_content, timeout_s, model=None, resume_session=None):
     env = dict(os.environ)
     env["OPENCODE_CONFIG_CONTENT"] = config_content
     argv = ["opencode", "run", "--format", "json"]
     if model:
         argv += ["--model", model]
+    if resume_session:
+        argv += ["--continue", "--session", resume_session]
     argv.append(prompt)
     try:
         proc = subprocess.run(argv, cwd=str(cwd), env=env, capture_output=True, text=True, timeout=timeout_s)
@@ -109,6 +111,33 @@ def parse_session_id(stdout):
         if sid:
             return sid
     return None
+
+
+def is_rate_failure(text):
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in ("rate", "429", "waf", "captcha"))
+
+
+def retry_invoke(ctx, prompt):
+    attempts = 0
+    session = None
+    budget = ctx.get("budget") or DEFAULTS
+    rc, stdout, stderr = 1, "", ""
+    while attempts < budget["backoff_attempts"]:
+        attempts += 1
+        rc, stdout, stderr = invoke_opencode(
+            prompt, ctx["repo"].eng, ctx["config"], ctx.get("slice_timeout_s") or DEFAULTS["slice_timeout_s"], ctx.get("model"), resume_session=session
+        )
+        if rc == 0:
+            break
+        text = f"{stdout}\n{stderr}"
+        if is_rate_failure(text):
+            wait = min(budget["rate_backoff_max_s"], budget["rate_backoff_s"] * (2 ** (attempts - 1)))
+        else:
+            wait = min(budget["backoff_max_s"], budget["backoff_base_s"] * (2 ** (attempts - 1)))
+        session = session or parse_session_id(stdout)
+        hx.sleep(wait)
+    return rc, stdout, stderr, attempts
 
 
 def export_usage(hx_mod, session_id):
@@ -141,7 +170,7 @@ def run_slice(ctx):
     repo = ctx["repo"]
     hyp = ctx["hyp"]
     prompt = build_prompt(hyp, ctx.get("brief") or "", ctx.get("slice_timeout_s") or DEFAULTS["slice_timeout_s"])
-    rc, stdout, stderr = invoke_opencode(prompt, repo.eng, ctx["config"], ctx.get("slice_timeout_s") or DEFAULTS["slice_timeout_s"], ctx.get("model"))
+    rc, stdout, stderr, attempts = retry_invoke(ctx, prompt)
     session = parse_session_id(stdout)
     usage = export_usage(hx, session) if session else {}
     record = {
@@ -155,3 +184,98 @@ def run_slice(ctx):
     }
     record_run(repo, record)
     return record
+
+
+def health_gate(hx_mod, repo, hyp):
+    scope = repo.scope()
+    probes = (scope.get("health") or {}).get("probes") or []
+    tag = hyp.get("session_tag")
+    if not probes or not tag:
+        return True, None
+    if hx_mod.health_get(repo, tag).get("dead_since"):
+        return False, tag
+    return True, tag
+
+
+def claim_peek_empty(repo):
+    with hx.flock(repo.hunt / ".lock.hyps"):
+        hyps, _ = hx.load_hyps(repo)
+    return not any(hyp["status"] == "open" for hyp in hyps)
+
+
+def request_stop(repo):
+    (repo.hunt / "runner.stop").touch()
+
+
+def write_pid(repo):
+    (repo.hunt / "runner.pid").write_text(str(os.getpid()))
+
+
+def install_signals(ctx):
+    def handler(signum, frame):
+        request_stop(ctx["repo"])
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT, handler)
+
+
+def check_stop(ctx):
+    repo = ctx["repo"]
+    budget = ctx["budget"]
+    if (repo.hunt / "runner.stop").exists():
+        return "kill"
+    if ctx["slices_done"] >= budget["slices_max"]:
+        return "slices"
+    if hx.now() - ctx["started_ts"] >= budget["wall_s"]:
+        return "wall"
+    if budget.get("token_cap") and ctx["tokens_used"] >= budget["token_cap"]:
+        return "tokens"
+    if budget.get("cost_cap") and ctx["cost_used"] >= budget["cost_cap"]:
+        return "cost"
+    if claim_peek_empty(repo):
+        return "empty_queue"
+    return None
+
+
+def runner_main(argv=None):
+    parser = argparse.ArgumentParser(prog="runner")
+    parser.add_argument("--engagement", default=".")
+    parser.add_argument("--slices", type=int, default=DEFAULTS["slices_max"])
+    parser.add_argument("--wall", type=int, default=DEFAULTS["wall_s"])
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--no-adjudicate", action="store_true")
+    args = parser.parse_args(argv)
+    repo = hx.Repo(Path(args.engagement).resolve())
+    os.environ["HX_ENGAGEMENT"] = str(repo.eng)
+    owner = f"runner-{os.getpid()}"
+    budget = {**DEFAULTS, "slices_max": args.slices, "wall_s": args.wall, "token_cap": None, "cost_cap": None}
+    ctx = {
+        "repo": repo, "hyp": None, "brief": "", "config": os.environ.get("RUNNER_CONFIG_CONTENT") or json.dumps({"default_agent": "hunt-auto"}),
+        "model": args.model, "budget": budget, "started_ts": hx.now(), "slices_done": 0, "tokens_used": 0, "cost_used": 0,
+    }
+    write_pid(repo)
+    install_signals(ctx)
+    while True:
+        reason = check_stop(ctx)
+        if reason:
+            print(f"runner: parada ({reason})")
+            break
+        hyp = claim_next(repo, owner)
+        if hyp is None:
+            print("runner: fila vazia")
+            break
+        alive, tag = health_gate(hx, repo, hyp)
+        if not alive:
+            hx.main(["result", hyp["id"], "--verdict", "blocked", "--note", f"sessao {tag} morta", "--force"])
+            ctx["slices_done"] += 1
+            continue
+        ctx["hyp"] = hyp
+        record = run_slice(ctx)
+        ctx["slices_done"] += 1
+        ctx["tokens_used"] += record.get("tokens") or 0
+        ctx["cost_used"] += record.get("cost") or 0
+    (repo.hunt / "runner.pid").unlink(missing_ok=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(runner_main())
