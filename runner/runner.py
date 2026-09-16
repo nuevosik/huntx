@@ -114,15 +114,20 @@ def parse_session_id(stdout):
 def export_usage(hx_mod, session_id):
     if not session_id:
         return {}
-    proc = subprocess.run(["opencode", "export", session_id], capture_output=True, text=True, timeout=60)
+    try:
+        proc = subprocess.run(["opencode", "export", session_id], capture_output=True, text=True, timeout=60)
+    except Exception:
+        return {}
     if proc.returncode != 0:
         return {}
     try:
         data = json.loads(proc.stdout)
     except Exception:
         return {}
-    usage = data.get("usage") or {}
-    return {"tokens": usage.get("tokens") or usage.get("total_tokens"), "cost": usage.get("cost")}
+    info = data.get("info") or {}
+    tokens = info.get("tokens") or {}
+    total = tokens.get("total") or sum(tokens.get(key, 0) or 0 for key in ("input", "output", "reasoning"))
+    return {"tokens": total or None, "cost": info.get("cost")}
 
 
 def record_run(repo, record):
