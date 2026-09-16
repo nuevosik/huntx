@@ -176,8 +176,10 @@ def adjudicate(repo, hid):
     except Exception as exc:
         return {"ran": True, "rc": None, "error": str(exc)[:200]}
     result = {"ran": True, "rc": proc.returncode, "promoted": proc.returncode == 0 and not draft_path.exists()}
-    if proc.returncode == 7:
-        result["pending_attest"] = True
+    if proc.returncode == 0 and draft_path.exists():
+        draft = hx.load_json(draft_path, {})
+        if draft.get("pass_requires_attest"):
+            result["pending_attest"] = True
     return result
 
 
