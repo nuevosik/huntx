@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -63,6 +64,7 @@ BRIEF:
 REGRAS:
 - Toda saída de rede via `hx run`; mutação fora de allowed_mutations estagia (exit 5) — não insista.
 - Feche com `hx result {id} --verdict ... --note ...` (confirmed exige finding verificado).
+- Para `confirmed`: monte o draft em `hunt/FINDINGS/drafts/{id}.json` (cenário differential/echo/callback conforme o caso) e rode `hx verify {id}`; só então `hx result {id} --verdict confirmed`.
 - Hipótese nova descoberta: `hx hypothesis add ...`.
 - Sem conclusão em {minutes} min: `hx result {id} --verdict blocked --note "give_up"` e pare.
 - Termine com um resumo curto: veredito, evidência, o que falta."""
@@ -82,9 +84,11 @@ def build_prompt(hyp, brief_text, slice_timeout_s):
     )
 
 
-def invoke_opencode(prompt, cwd, config_content, timeout_s, model=None, resume_session=None):
+def invoke_opencode(prompt, cwd, config_content, timeout_s, model=None, resume_session=None, env_extra=None):
     env = dict(os.environ)
     env["OPENCODE_CONFIG_CONTENT"] = config_content
+    if env_extra:
+        env.update(env_extra)
     argv = ["opencode", "run", "--format", "json"]
     if model:
         argv += ["--model", model]
@@ -122,11 +126,13 @@ def retry_invoke(ctx, prompt):
     attempts = 0
     session = None
     budget = ctx.get("budget") or DEFAULTS
+    owner = ctx.get("owner")
+    env_extra = {"HX_SESSION": owner} if owner else None
     rc, stdout, stderr = 1, "", ""
     while attempts < budget["backoff_attempts"]:
         attempts += 1
         rc, stdout, stderr = invoke_opencode(
-            prompt, ctx["repo"].eng, ctx["config"], ctx.get("slice_timeout_s") or DEFAULTS["slice_timeout_s"], ctx.get("model"), resume_session=session
+            prompt, ctx["repo"].eng, ctx["config"], ctx.get("slice_timeout_s") or DEFAULTS["slice_timeout_s"], ctx.get("model"), resume_session=session, env_extra=env_extra
         )
         if rc == 0:
             break
@@ -144,20 +150,27 @@ def retry_invoke(ctx, prompt):
 def export_usage(hx_mod, session_id):
     if not session_id:
         return {}
+    fd, name = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    tmp = Path(name)
     try:
-        proc = subprocess.run(["opencode", "export", session_id], capture_output=True, text=True, timeout=60)
-    except Exception:
-        return {}
-    if proc.returncode != 0:
-        return {}
-    try:
-        data = json.loads(proc.stdout)
-    except Exception:
-        return {}
-    info = data.get("info") or {}
-    tokens = info.get("tokens") or {}
-    total = tokens.get("total") or sum(tokens.get(key, 0) or 0 for key in ("input", "output", "reasoning"))
-    return {"tokens": total or None, "cost": info.get("cost")}
+        try:
+            with open(tmp, "w") as handle:
+                proc = subprocess.run(["opencode", "export", session_id], stdout=handle, stderr=subprocess.DEVNULL, timeout=60)
+        except Exception:
+            return {}
+        if proc.returncode != 0:
+            return {}
+        try:
+            data = json.loads(tmp.read_text())
+        except Exception:
+            return {}
+        info = data.get("info") or {}
+        tokens = info.get("tokens") or {}
+        total = tokens.get("total") or sum(tokens.get(key, 0) or 0 for key in ("input", "output", "reasoning"))
+        return {"tokens": total or None, "cost": info.get("cost")}
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def record_run(repo, record):
@@ -292,7 +305,7 @@ def runner_main(argv=None):
     budget = {**DEFAULTS, "slices_max": args.slices, "wall_s": args.wall, "token_cap": None, "cost_cap": None}
     config = os.environ.get("RUNNER_CONFIG_CONTENT") or build_config_content(REPO_ROOT / "opencode" / "agents" / "hunt-auto.md")
     ctx = {
-        "repo": repo, "hyp": None, "brief": "", "config": config,
+        "repo": repo, "hyp": None, "brief": "", "config": config, "owner": owner,
         "model": args.model, "budget": budget, "started_ts": hx.now(), "slices_done": 0, "tokens_used": 0, "cost_used": 0,
         "no_adjudicate": args.no_adjudicate,
     }
