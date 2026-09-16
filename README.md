@@ -1,51 +1,46 @@
 # huntx
 
-Harness de caça a vulnerabilidades para sessões com LLM: **o estado da caça vive fora do modelo**.
+A hunt harness for LLM-driven security work: **the hunt state lives outside the model.**
 
-Sessões de LLM são amnésicas, otimistas demais e perigosas com a rede solta. O huntx é a bancada em volta delas: memória durável, work orders, freio de escopo e verificação mecânica de achados.
+LLM sessions are amnesiac, over-eager, and careless with open network access. huntx is the bench around them: durable memory, work orders, scope guardrails, mechanically verified findings.
 
-## Componentes
+## Components
 
-| peça | o que faz |
-|---|---|
-| `bin/hx` | CLI de arquivo único (Python + curl_cffi): fila de hipóteses com claim/TTL, coverage por endpoint×classe, `brief` limitado por bytes, rate adaptativo (step-up em 429/WAF, decaimento entre runs), guard de escopo + staging de mutações (exit 5; execução só pelo humano em TTY), `run` com evidência redigida na captura + `raw_sha256`, health de sessões (strikes, janela de morte, reabertura retroativa), `verify` diferencial + assinatura manual (TTY), proxy CONNECT com allowlist e rate compartilhado |
-| `opencode/` | camada de integração: agente `hunt` (prompt de work order + permissões), plugin (injeção do brief, env do proxy, tripwire com audit), commands `/brief` `/next` `/debrief`, `install.sh` |
-| `templates/` | `scope.json` e `HUNT.md` para novos engagements |
-| `specs/`, `plans/` | design (Rev 5) e plano de implementação (fase 1) |
+- **`bin/hx`** — single-file Python CLI (curl_cffi): hypothesis queue (claim/TTL), endpoint×class coverage, byte-bounded `brief`, adaptive rate (step-up on 429/WAF, decay between runs), scope guard with mutation staging (exit 5; humans execute in a TTY), `run` with capture-time redaction and `raw_sha256` evidence, session health (strikes, death window, retroactive reopen), differential `verify` plus manual attestation, allowlist CONNECT proxy sharing the rate state.
+- **`opencode/`** — integration layer: `hunt` agent (work-order prompt + permissions), plugin (brief injection, proxy env, tripwire with audit log), `/brief` `/next` `/debrief` commands, `install.sh`.
+- **`templates/`** — starter `scope.json` and session protocol. **`specs/` `plans/`** — design (Rev 5) and phase-1 plan.
 
-## Conceitos
+## Design rules
 
-- **Work order = claim, não pergunta.** "Confirme ou refute isto" — nunca "procure problemas".
-- **Evidência redigida na origem**: segredos de alta entropia viram `sha256:<12>`, de baixa entropia são dropados; PII é redigida; o marcador que É a prova fica num bloco isento.
-- **Freio estrutural**: mutação fora de `allowed_mutations` estagia (exit 5) e só o humano executa, em TTY, com o host digitado.
-- **Refute honesto**: refutação baseada em 401/403/redirect-login exige sessão viva; morte de sessão reabre resultados fechados na janela de morte.
-- **Achado só existe verificado**: `FINDINGS/<id>.json` com cenário PASS ou atestação assinada — `result --verdict confirmed` rejeita o resto.
+- **Work orders, not open questions.** "Confirm or refute this claim" — never "find bugs".
+- **Evidence is redacted at capture.** High-entropy secrets → `sha256:<12>`, low-entropy dropped, PII redacted; the proof marker lives in an exempt block.
+- **Mutations are staged by default.** Anything outside `allowed_mutations` exits 5; only a human executes it, in a TTY, typing the host.
+- **Refutations need a live session.** 401/403/redirect-login refutes fire an on-demand probe; a dead session reopens results closed inside the death window.
+- **A finding exists only when verified.** `FINDINGS/<id>.json` with a scenario PASS or a signed attestation — `result --verdict confirmed` rejects everything else.
 
 ## Quickstart
 
 ```bash
-# 1. instalar a camada opencode (symlinks em ~/.config/opencode + ~/.local/bin/hx)
-bash install.sh
-# adicionar ao array "plugin" do ~/.config/opencode/opencode.jsonc:
-#   "file:///caminho/para/huntx/opencode/plugin/hunt.ts"
-# reiniciar o opencode
+bash install.sh   # symlinks into ~/.config/opencode + ~/.local/bin/hx
+# add to the "plugin" array of ~/.config/opencode/opencode.jsonc:
+#   "file:///path/to/huntx/opencode/plugin/hunt.ts"
+# restart opencode
 
-# 2. engagement novo
-mkdir -p ~/hunts/alvo && cd ~/hunts/alvo
+mkdir -p ~/hunts/target && cd ~/hunts/target
 hx init --dir .
-# editar hunt/scope.json: hosts in/out, paths banidos, rate, probes de sessão
+# edit hunt/scope.json: hosts, banned paths, rate, session probes
 hx hypothesis add --claim "..." --endpoint "GET /api/x" --class BOLA --confirm "..." --refute "..."
-hx brief     # digest da sessão
-hx next      # work orders (claima)
+hx brief
+hx next
 ```
 
-## Testes
+## Tests
 
 ```bash
-python3 tests/test_hx.py                   # 64 testes, stdlib
-node --test tests/plugin_guard.test.mjs    # 8 testes do tripwire
+python3 tests/test_hx.py                 # 64 tests, stdlib
+node --test tests/plugin_guard.test.mjs  # 8 tripwire tests
 ```
 
-## Postura de escopo
+## Scope
 
-O huntx não é um sandbox. O tripwire denuncia e bloqueia os caminhos convenientes, o guard é a única saída de rede do tráfego scriptado e o proxy cobre clientes que honram `HTTP(S)_PROXY` — nada disso substitui autorização e as regras do programa. Use apenas em escopo autorizado.
+Not a sandbox. The tripwire blocks convenient paths, the guard is the only network exit for scripted traffic, and the proxy covers clients that honor `HTTP(S)_PROXY` — none of it replaces authorization and program rules. Authorized scope only.
