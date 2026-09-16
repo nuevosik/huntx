@@ -21,6 +21,12 @@
 - Sessão suspeita → `hx health check --session <tag>`.
 - Probes contam no rate; nada de "tráfego de sistema".
 
+## Cenários do verify
+
+- **differential** — vítima/atacante/controle com sessões próprias; PASS automático com marcador longo; marcador curto (< 6) exige `--attest`.
+- **echo** — param refletidor: `payload_template` sempre com `{CANARY}`; reflita cru via `{payload}` (percent-encoded) ou `{payload_raw}` na URL; **sempre exige `--attest`** (prova contextual).
+- **callback** — BYO webhook.site: crie a URL no browser e cole `collaborator.url` + `collaborator.poll.url` no draft antes do verify. Timeout **não** refuta — feche com `blocked` ou `unverified`.
+
 ## Fim de sessão (/debrief)
 
 - Escreve `hunt/sessions/AAAA-MM-DD-NN.md`: o que rodou, vereditos, hipóteses novas, deltas de coverage, dúvidas abertas.

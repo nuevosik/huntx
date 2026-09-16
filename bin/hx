@@ -908,9 +908,12 @@ def run_differential(repo, scope, draft):
 
 
 def run_echo(repo, scope, draft):
+    template = draft.get("payload_template") or ""
+    if "{CANARY}" not in template:
+        raise HxError("payload_template precisa conter {CANARY}", EXIT_GUARD)
     request = draft["request"]
     canary = secrets.token_hex(6)
-    payload = draft["payload_template"].replace("{CANARY}", canary)
+    payload = template.replace("{CANARY}", canary)
     url = request["url"].replace("{payload}", quote(payload, safe="")).replace("{payload_raw}", payload)
     status, headers, body = guarded_fetch(repo, scope, request["method"], url, draft.get("session"), draft.get("headers"))
     raw_present = payload in body
@@ -983,14 +986,27 @@ def run_callback(repo, scope, draft):
     return hit is not None, steps
 
 
+def strip_fail_meta(draft):
+    for key in ("fail_reason", "failed_at", "fail_detail"):
+        draft.pop(key, None)
+
+
 def run_attest(repo, draft, draft_path):
     if not stdin_is_tty():
         raise HxError("attest exige TTY interativo", EXIT_TTY)
-    proof = draft.get("proof")
-    if proof:
-        victim = proof.get("victim", {})
-        attacker = proof.get("attacker", {})
-        control = proof.get("control", {})
+    proof = draft.get("proof") or {}
+    if "canary" in proof:
+        print("prova mecanica do draft:")
+        print(f"  canario: {proof.get('canary')}")
+        print(f"  raw presente: {proof.get('raw_present')} | escaped presente: {proof.get('escaped_present')}")
+    elif "interaction" in proof:
+        print("prova mecanica do draft:")
+        print(f"  baseline hits: {proof.get('baseline_hits')}")
+        print(f"  interacao: {proof.get('interaction')} | hit: {json.dumps((proof.get('hit') or [])[:1], ensure_ascii=False)}")
+    elif proof.get("victim"):
+        victim = proof["victim"]
+        attacker = proof.get("attacker") or {}
+        control = proof.get("control") or {}
         print("prova mecanica do draft:")
         print(f"  marcador: {victim.get('marker')}")
         print(f"  vitima: {victim.get('status')} | atacante: {attacker.get('status')} (marker presente: {attacker.get('marker_present')}) | controle: {control.get('status')} (marker ausente: {control.get('marker_absent')})")
@@ -1004,6 +1020,7 @@ def run_attest(repo, draft, draft_path):
         tty = os.ttyname(sys.stdin.fileno())
     except OSError:
         tty = None
+    strip_fail_meta(draft)
     draft["verified_at"] = now()
     draft["verdict"] = "verified-manual"
     draft["attest"] = {"draft_id": draft["id"], "uid": os.getuid(), "tty": tty, "ts": now()}
@@ -1045,6 +1062,7 @@ def cmd_verify(args):
             print(f"{draft['id']}: PASS fraco (marker curto '{steps['victim']['marker']}') — assine com: hx verify {draft['id']} --attest")
         return EXIT_OK
     if passed:
+        strip_fail_meta(draft)
         draft["verified_at"] = now()
         draft["proof"] = steps
         dump_json(repo.hunt / "FINDINGS" / f"{draft['id']}.json", draft)
