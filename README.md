@@ -37,7 +37,7 @@ hx next
 ## Tests
 
 ```bash
-python3 tests/test_hx.py                 # 81 tests, stdlib
+python3 tests/test_hx.py                 # 90 tests, stdlib
 node --test tests/plugin_guard.test.mjs  # 10 tripwire tests
 ```
 
