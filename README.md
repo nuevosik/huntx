@@ -8,7 +8,7 @@ LLM sessions are amnesiac, over-eager, and careless with open network access. hu
 
 - **`bin/hx`** — single-file Python CLI (curl_cffi): hypothesis queue (claim/TTL), endpoint×class coverage, byte-bounded `brief`, adaptive rate (step-up on 429/WAF, decay between runs), scope guard with mutation staging (exit 5; humans execute in a TTY), `run` with capture-time redaction and `raw_sha256` evidence, session health (strikes, death window, retroactive reopen), differential `verify` plus manual attestation, allowlist CONNECT proxy sharing the rate state.
 - **`opencode/`** — integration layer: `hunt` agent (work-order prompt + permissions), plugin (brief injection, proxy env, tripwire with audit log), `/brief` `/next` `/debrief` commands, `install.sh`.
-- **`templates/`** — starter `scope.json` and session protocol. **`specs/` `plans/`** — design (Rev 5) and phase-1 plan.
+- **`templates/`** — starter `scope.json` and session protocol.
 
 ## Design rules
 
