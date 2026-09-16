@@ -804,6 +804,100 @@ def cmd_run(args):
     return EXIT_OK
 
 
+def run_differential(repo, scope, draft):
+    request = draft["request"]
+    url_template = request["url"]
+    victim_object = request.get("victim_object") or {}
+    attacker_object = (draft.get("control") or {}).get("attacker_own_object") or {}
+    pattern = (draft.get("marker") or {}).get("extract")
+
+    def call(session_file, url):
+        cookies = load_session(repo.eng / session_file)
+        host = urlparse(url).hostname or ""
+        rate_acquire(scope, repo, host, float(scope["rate"].get("max_wait_s", 30)))
+        return fetch(request["method"], url, None, None, cookies)
+
+    def substitute(url, mapping):
+        for key, value in mapping.items():
+            url = url.replace("{" + key + "}", str(value))
+            victim_value = victim_object.get(key)
+            if victim_value is not None:
+                url = url.replace(str(victim_value), str(value))
+        return url
+
+    victim_url = substitute(url_template, victim_object)
+    attacker_url = victim_url
+    control_url = substitute(url_template, attacker_object)
+
+    output_dir = repo.hunt / "FINDINGS" / "drafts" / draft["id"]
+    steps = {}
+    victim_status, victim_headers, victim_body = call(draft["victim_session"], victim_url)
+    marker = extract_marker(pattern, victim_body)
+    steps["victim"] = {"status": victim_status, "marker": marker}
+    attacker_status, attacker_headers, attacker_body = call(draft["attacker_session"], attacker_url)
+    marker_present = 200 <= attacker_status < 300 and bool(marker) and marker in attacker_body
+    steps["attacker"] = {"status": attacker_status, "marker_present": marker_present}
+    control_status, control_headers, control_body = call(draft["attacker_session"], control_url)
+    marker_absent = 200 <= control_status < 300 and not (bool(marker) and marker in control_body)
+    steps["control"] = {"status": control_status, "marker_absent": marker_absent}
+
+    def evidence(step, url, status, headers, body, proof):
+        save_evidence(
+            repo,
+            output_dir,
+            {"kind": "verify", "step": step, "draft": draft["id"]},
+            {"method": request["method"], "url": url, "headers": {}, "body": None},
+            {"status": status, "headers": redact_headers(headers), "body": (redact_body(body) or "")[:8192], "integrity": {"raw_sha256": hashlib.sha256((body or "").encode("utf-8", errors="ignore")).hexdigest(), "body_len": len(body or "")}},
+            proof,
+        )
+
+    evidence("victim", victim_url, victim_status, victim_headers, victim_body, {"marker": marker})
+    evidence("attacker", attacker_url, attacker_status, attacker_headers, attacker_body, {"marker": marker})
+    evidence("control", control_url, control_status, control_headers, control_body, {})
+    passed = 200 <= victim_status < 300 and bool(marker) and marker_present and marker_absent
+    requires_attest = passed and len(str(marker)) < 6
+    return passed, steps, requires_attest
+
+
+def run_attest(repo, draft, draft_path):
+    raise HxError("attest chega na Task 11", EXIT_GUARD)
+
+
+def cmd_verify(args):
+    repo = repo_from_cwd()
+    scope = repo.scope()
+    draft_path = repo.hunt / "FINDINGS" / "drafts" / f"{args.id}.json"
+    draft = load_json(draft_path, None)
+    if draft is None:
+        raise HxError(f"draft nao encontrado: {args.id}", EXIT_GUARD)
+    if getattr(args, "attest", False):
+        run_attest(repo, draft, draft_path)
+        return EXIT_OK
+    scenario = draft.get("scenario")
+    if scenario == "differential":
+        passed, steps, requires_attest = run_differential(repo, scope, draft)
+    else:
+        raise HxError(f"cenario nao suportado no v1: {scenario}", EXIT_GUARD)
+    if passed and requires_attest:
+        draft["pass_requires_attest"] = True
+        draft["proof"] = steps
+        dump_json(draft_path, draft)
+        print(f"{draft['id']}: PASS fraco (marker curto '{steps['victim']['marker']}') — assine com: hx verify {draft['id']} --attest")
+        return EXIT_OK
+    if passed:
+        draft["verified_at"] = now()
+        draft["proof"] = steps
+        dump_json(repo.hunt / "FINDINGS" / f"{draft['id']}.json", draft)
+        draft_path.unlink()
+        print(f"{draft['id']}: PASS — {json.dumps(steps, ensure_ascii=False)}")
+        return EXIT_OK
+    draft["failed_at"] = now()
+    draft["fail_detail"] = steps
+    dump_json(draft_path, draft)
+    print(f"{draft['id']}: FAIL — {json.dumps(steps, ensure_ascii=False)}")
+    return EXIT_OK
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="hx")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -859,6 +953,9 @@ def main(argv=None):
     run_p.add_argument("--marker")
     run_p.add_argument("--hypothesis")
     run_p.add_argument("--json", dest="json_out", action="store_true")
+    verify_p = sub.add_parser("verify")
+    verify_p.add_argument("id")
+    verify_p.add_argument("--attest", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.cmd == "init":
@@ -879,6 +976,8 @@ def main(argv=None):
             return cmd_health_check(args)
         elif args.cmd == "run":
             return cmd_run(args)
+        elif args.cmd == "verify":
+            return cmd_verify(args)
         elif args.cmd == "rate":
             if args.rate_cmd == "show":
                 cmd_rate_show(args)
