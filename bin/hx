@@ -183,6 +183,7 @@ def cmd_hypothesis_add(args):
             "claim": args.claim,
             "endpoint": args.endpoint,
             "class": args.cls,
+            "source": args.source,
             "confirm": args.confirm,
             "refute": args.refute,
             "evidence": args.evidence or f"scans/evidence/{hid}",
@@ -196,6 +197,23 @@ def cmd_hypothesis_add(args):
         })
         save_hyps(repo, hyps)
     print(hid)
+
+
+def cmd_hypothesis_drop(args):
+    repo = repo_from_cwd()
+    with flock(repo.hunt / ".lock.hyps"):
+        hyps, _ = load_hyps(repo)
+        for hyp in hyps:
+            if hyp["id"] != args.id:
+                continue
+            if hyp.get("status") == "result" and not args.force:
+                raise HxError("hipotese fechada (result) — drop exige --force", EXIT_GUARD)
+            hyp["status"] = "dropped"
+            hyp["owner"] = None
+            save_hyps(repo, hyps)
+            print(f"{hyp['id']} -> dropped")
+            return
+    raise HxError(f"hipotese nao encontrada: {args.id}", EXIT_GUARD)
 
 
 def cmd_next(args):
@@ -216,7 +234,8 @@ def cmd_next(args):
             picked.append(hyp)
         save_hyps(repo, hyps)
     for hyp in picked:
-        print(f"[{hyp['id']}] {hyp['claim']}")
+        label = f"[{hyp['id']}]" + (" [planner]" if hyp.get("source") == "planner" else "")
+        print(f"{label} {hyp['claim']}")
         print(f"  endpoint: {hyp['endpoint']} | classe: {hyp['class']}")
         print(f"  confirm: {hyp['confirm']}")
         print(f"  refute:  {hyp['refute']}")
@@ -396,7 +415,8 @@ def cmd_brief(args):
     if open_hyps:
         parts.append("hipoteses abertas:")
         for hyp in open_hyps[:5]:
-            parts.append(f"  [{hyp['id']}] {hyp['claim'][:80]}")
+            label = f"[{hyp['id']}]" + (" [planner]" if hyp.get("source") == "planner" else "")
+            parts.append(f"  {label} {hyp['claim'][:80]}")
     sessions_dir = repo.hunt / "sessions"
     sessions = sorted(sessions_dir.glob("*.md")) if sessions_dir.exists() else []
     if sessions:
@@ -1185,6 +1205,10 @@ def main(argv=None):
     add_p.add_argument("--refute", required=True)
     add_p.add_argument("--evidence")
     add_p.add_argument("--session-tag", dest="session_tag")
+    add_p.add_argument("--source")
+    drop_p = hyp_sub.add_parser("drop")
+    drop_p.add_argument("id")
+    drop_p.add_argument("--force", action="store_true")
     next_p = sub.add_parser("next")
     next_p.add_argument("n", nargs="?", type=int, default=3)
     next_p.add_argument("--peek", action="store_true")
@@ -1234,7 +1258,10 @@ def main(argv=None):
         if args.cmd == "init":
             cmd_init(args)
         elif args.cmd == "hypothesis":
-            cmd_hypothesis_add(args)
+            if args.hyp_cmd == "drop":
+                cmd_hypothesis_drop(args)
+            else:
+                cmd_hypothesis_add(args)
         elif args.cmd == "next":
             cmd_next(args)
         elif args.cmd == "release":
