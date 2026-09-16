@@ -338,6 +338,78 @@ def cmd_brief(args):
     print(text)
 
 
+LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+
+
+def host_matches(pattern, host):
+    pattern = pattern.lower().strip()
+    host = host.lower()
+    if pattern.startswith("*."):
+        return host.endswith(pattern[1:]) or host == pattern[2:]
+    return host == pattern or host.endswith("." + pattern)
+
+
+def check_scope(scope, url):
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path or "/"
+    if host in LOOPBACK:
+        return True, None
+    for banned in scope.get("out_of_scope_paths", []):
+        prefix = banned.rstrip("/")
+        if path == prefix or path.startswith(prefix + "/"):
+            return False, f"path banido: {banned}"
+    for pattern in scope.get("out_of_scope_hosts", []):
+        if host_matches(pattern, host):
+            return False, f"host banido: {pattern}"
+    for pattern in scope.get("in_scope", []):
+        if host_matches(pattern, host):
+            return True, None
+    for pattern in scope.get("allow_extra_hosts", []):
+        if host_matches(pattern, host):
+            return True, None
+    return False, f"host fora do escopo: {host}"
+
+
+def classify_method(scope, method, url):
+    if method.upper() in ("GET", "HEAD"):
+        return "auto"
+    path = urlparse(url).path or "/"
+    for entry in scope.get("allowed_mutations", []):
+        entry_method, _, entry_path = entry.partition(" ")
+        prefix = entry_path.rstrip("/")
+        if entry_method.upper() == method.upper() and (path == prefix or path.startswith(prefix + "/")):
+            return "auto"
+    return "staged"
+
+
+def stage_pending(repo, spec):
+    (repo.hunt / "pending").mkdir(parents=True, exist_ok=True)
+    pending_id = str(int(now()))
+    record = {"id": pending_id, "staged_ts": now(), **spec}
+    dump_json(repo.hunt / "pending" / f"{pending_id}.json", record)
+    return pending_id
+
+
+def cmd_pending(args):
+    repo = repo_from_cwd()
+    if args.pending_cmd == "list":
+        for path in sorted((repo.hunt / "pending").glob("*.json")):
+            record = load_json(path, {})
+            print(f"{record.get('id')} {record.get('method')} {record.get('url')}")
+    elif args.pending_cmd == "show":
+        record = load_json(repo.hunt / "pending" / f"{args.id}.json", None)
+        if record is None:
+            raise HxError(f"pending nao encontrado: {args.id}", EXIT_GUARD)
+        print(json.dumps(record, indent=1, ensure_ascii=False))
+    elif args.pending_cmd == "run":
+        cmd_pending_run(repo, args.id)
+
+
+def cmd_pending_run(repo, pending_id):
+    raise HxError("pending run chega na Task 7", EXIT_GUARD)
+
+
 def rate_effective_interval(scope, state, host):
     floor = float(scope["rate"]["per_host_interval_s"])
     effective = state.get("effective", {}).get(host)
@@ -431,6 +503,13 @@ def main(argv=None):
     res_p.add_argument("--force", action="store_true")
     brief_p = sub.add_parser("brief")
     brief_p.add_argument("--max-bytes", dest="max_bytes", type=int, default=4000)
+    pending_p = sub.add_parser("pending")
+    pending_sub = pending_p.add_subparsers(dest="pending_cmd", required=True)
+    pending_sub.add_parser("list")
+    pending_show_p = pending_sub.add_parser("show")
+    pending_show_p.add_argument("id")
+    pending_run_p = pending_sub.add_parser("run")
+    pending_run_p.add_argument("id")
     rate_p = sub.add_parser("rate")
     rate_sub = rate_p.add_subparsers(dest="rate_cmd", required=True)
     rate_sub.add_parser("show")
@@ -450,6 +529,8 @@ def main(argv=None):
             cmd_result(args)
         elif args.cmd == "brief":
             cmd_brief(args)
+        elif args.cmd == "pending":
+            cmd_pending(args)
         elif args.cmd == "rate":
             if args.rate_cmd == "show":
                 cmd_rate_show(args)
