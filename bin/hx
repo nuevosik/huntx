@@ -338,6 +338,70 @@ def cmd_brief(args):
     print(text)
 
 
+def rate_effective_interval(scope, state, host):
+    floor = float(scope["rate"]["per_host_interval_s"])
+    effective = state.get("effective", {}).get(host)
+    if not effective:
+        return floor
+    events = [event for event in state.get("events", []) if event.get("host") == host]
+    if not events:
+        return floor
+    last_ts = max(event["ts"] for event in events)
+    decay_min = float(scope["rate"].get("decay_clean_min", 60))
+    decay = int((now() - last_ts) // (decay_min * 60))
+    return max(floor, effective / (2 ** decay))
+
+
+def rate_acquire(scope, repo, host, max_wait):
+    with flock(repo.hunt / ".lock.rate"):
+        state = load_json(repo.rate, {})
+        interval = rate_effective_interval(scope, state, host)
+        global_interval = float(scope["rate"].get("global_interval_s", 0.5))
+        t = now()
+        last = (state.get("hosts", {}).get(host, {}) or {}).get("last") or 0
+        global_last = state.get("global") or 0
+        scheduled = max(t, last + interval, global_last + global_interval)
+        wait = scheduled - t
+        if wait > max_wait:
+            raise HxError(f"rate: esperaria {wait:.1f}s (max {max_wait}s)", EXIT_RATE)
+        if wait > 0:
+            sleep(wait)
+        state.setdefault("hosts", {}).setdefault(host, {})["last"] = scheduled
+        state["global"] = scheduled
+        dump_json(repo.rate, state)
+        return wait
+
+
+def rate_step_up(scope, repo, host, cause):
+    with flock(repo.hunt / ".lock.rate"):
+        state = load_json(repo.rate, {})
+        floor = float(scope["rate"]["per_host_interval_s"])
+        cap = float(scope["rate"].get("step_up_max_s", 30))
+        current = max(floor, float(state.get("effective", {}).get(host, floor)))
+        new = min(cap, current * 2)
+        state.setdefault("effective", {})[host] = new
+        state.setdefault("events", []).append({"ts": now(), "host": host, "cause": cause, "interval": new})
+        dump_json(repo.rate, state)
+        return new
+
+
+def cmd_rate_show(args):
+    repo = repo_from_cwd()
+    print(json.dumps(load_json(repo.rate, {}), indent=1))
+
+
+def cmd_rate_reset(args):
+    if not stdin_is_tty():
+        raise HxError("rate reset exige TTY", EXIT_TTY)
+    repo = repo_from_cwd()
+    with flock(repo.hunt / ".lock.rate"):
+        state = load_json(repo.rate, {})
+        state["effective"] = {}
+        state.setdefault("events", []).append({"ts": now(), "host": "*", "cause": "manual reset", "interval": None})
+        dump_json(repo.rate, state)
+    print("rate reiniciado — piso restaurado")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="hx")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -367,6 +431,11 @@ def main(argv=None):
     res_p.add_argument("--force", action="store_true")
     brief_p = sub.add_parser("brief")
     brief_p.add_argument("--max-bytes", dest="max_bytes", type=int, default=4000)
+    rate_p = sub.add_parser("rate")
+    rate_sub = rate_p.add_subparsers(dest="rate_cmd", required=True)
+    rate_sub.add_parser("show")
+    rate_reset_p = rate_sub.add_parser("reset")
+    rate_reset_p.add_argument("--to-floor", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.cmd == "init":
@@ -381,6 +450,11 @@ def main(argv=None):
             cmd_result(args)
         elif args.cmd == "brief":
             cmd_brief(args)
+        elif args.cmd == "rate":
+            if args.rate_cmd == "show":
+                cmd_rate_show(args)
+            else:
+                cmd_rate_reset(args)
         return EXIT_OK
     except HxError as err:
         print(f"hx: {err}", file=sys.stderr)
