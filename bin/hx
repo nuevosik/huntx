@@ -105,14 +105,37 @@ def repo_from_cwd():
     return Repo(find_engagement())
 
 
+def cmd_init(args):
+    eng = Path(args.dir).resolve()
+    hunt = eng / "hunt"
+    if (hunt / "scope.json").exists():
+        raise HxError("engagement ja inicializado", EXIT_GUARD)
+    templates = Path(__file__).resolve().parent.parent / "templates"
+    hunt.mkdir(parents=True, exist_ok=True)
+    scope = load_json(templates / "scope.json", {})
+    scope["engagement"] = eng.name
+    dump_json(hunt / "scope.json", scope)
+    for name in ("TARGET.md", "COVERAGE.md"):
+        atomic_write(hunt / name, "")
+    dump_json(hunt / "HYPOTHESES.json", [])
+    for sub in ("FINDINGS/drafts", "pending", "sessions"):
+        (hunt / sub).mkdir(parents=True, exist_ok=True)
+    protocol = templates / "HUNT.md"
+    if protocol.exists():
+        atomic_write(eng / "HUNT.md", protocol.read_text())
+    atomic_write(hunt / ".gitignore", "scans/\nsessions/\n.health.json\n.ratelimit.json\npending/\n")
+    print(f"engagement inicializado: {hunt}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="hx")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("init")
+    init_p = sub.add_parser("init")
+    init_p.add_argument("--dir", default=".")
     args = parser.parse_args(argv)
     try:
         if args.cmd == "init":
-            print("not implemented")
+            cmd_init(args)
         return EXIT_OK
     except HxError as err:
         print(f"hx: {err}", file=sys.stderr)
