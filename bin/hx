@@ -136,7 +136,7 @@ def cmd_init(args):
     protocol = templates / "HUNT.md"
     if protocol.exists():
         atomic_write(eng / "HUNT.md", protocol.read_text())
-    atomic_write(hunt / ".gitignore", "scans/\nsessions/\n.health.json\n.ratelimit.json\npending/\n")
+    atomic_write(hunt / ".gitignore", "scans/\nsessions/\n.health.json\n.ratelimit.json\npending/\naudit.log\n")
     print(f"engagement inicializado: {hunt}")
 
 
@@ -318,8 +318,19 @@ def evidence_auth_failure(repo, hyp):
     files = sorted(evidence_dir.glob("*.json"), key=lambda path: path.stat().st_mtime)
     if not files:
         return False
-    status = (load_json(files[-1], {}).get("response") or {}).get("status")
-    return isinstance(status, int) and status in AUTH_FAIL_STATUSES
+    response = load_json(files[-1], {}).get("response") or {}
+    status = response.get("status")
+    if not isinstance(status, int):
+        return False
+    if status in AUTH_FAIL_STATUSES:
+        return True
+    if 300 <= status < 400:
+        headers = response.get("headers") or {}
+        location = headers.get("location") or headers.get("Location") or ""
+        for sig in (repo.scope().get("health") or {}).get("session_invalid_if", []):
+            if sig.startswith("redirect_host:") and sig.split(":", 1)[1] in location:
+                return True
+    return False
 
 
 def refute_gate(repo, hyp):
@@ -594,17 +605,24 @@ def load_session(path):
     return load_json(Path(path), [])
 
 
-def fetch(method, url, headers=None, body=None, cookies=None):
-    from curl_cffi import requests as creq
-    session = creq.Session(impersonate="chrome131")
-    for cookie in cookies or []:
-        session.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain", ""), path=cookie.get("path", "/"))
+def http_request(session, method, url, headers, body):
     response = session.request(method, url, headers=headers or {}, data=body, timeout=30, allow_redirects=False)
     return response.status_code, dict(response.headers), response.text
 
 
-def audit(repo, actor, tool, payload, verdict, reason):
-    entry = json.dumps({"ts": now(), "actor": actor, "tool": tool, "payload": (payload or "")[:200], "verdict": verdict, "reason": reason}, ensure_ascii=False)
+def fetch(method, url, headers=None, body=None, cookies=None):
+    from curl_cffi import requests as creq
+    session = creq.Session(impersonate="chrome131", trust_env=False)
+    for cookie in cookies or []:
+        session.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain", ""), path=cookie.get("path", "/"))
+    try:
+        return http_request(session, method, url, headers, body)
+    except Exception as err:
+        raise HxError(f"transporte: {err}", EXIT_TRANSPORT)
+
+
+def audit(repo, actor, tool, args_digest, verdict, reason):
+    entry = json.dumps({"ts": now(), "actor": actor, "tool": tool, "args_digest": (args_digest or "")[:200], "verdict": verdict, "reason": reason}, ensure_ascii=False)
     with flock(repo.hunt / ".lock.audit"):
         with open(repo.hunt / "audit.log", "a") as handle:
             handle.write(entry + "\n")
@@ -761,6 +779,10 @@ def cmd_health_check(args):
 
 def execute_request(repo, scope, method, url, session_path, body, marker, save_dir, hypothesis, headers=None):
     host = urlparse(url).hostname or ""
+    if session_path:
+        tag = Path(session_path).stem.replace("session_", "")
+        if health_get(repo, tag).get("dead_since"):
+            raise HxError(f"sessao {tag} morta — reautentique antes de usar", EXIT_SESSION)
     max_wait = float(scope["rate"].get("max_wait_s", 30))
     rate_acquire(scope, repo, host, max_wait)
     cookies = load_session(repo.eng / session_path) if session_path else []
@@ -818,6 +840,8 @@ def run_differential(repo, scope, draft):
         allowed, reason = check_scope(scope, url)
         if not allowed:
             raise HxError(f"guard: {reason}", EXIT_GUARD)
+        if classify_method(scope, request["method"], url) == "staged":
+            raise HxError(f"verify nao executa metodo estagiado: {request['method']} {url}", EXIT_STAGED)
         cookies = load_session(repo.eng / session_file)
         host = urlparse(url).hostname or ""
         rate_acquire(scope, repo, host, float(scope["rate"].get("max_wait_s", 30)))
@@ -1088,6 +1112,9 @@ def main(argv=None):
             else:
                 cmd_rate_reset(args)
         return EXIT_OK
+    except json.JSONDecodeError as err:
+        print(f"hx: estado corrompido: {err}", file=sys.stderr)
+        return EXIT_GUARD
     except HxError as err:
         print(f"hx: {err}", file=sys.stderr)
         return err.code
