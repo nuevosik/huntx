@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import select
 import socket
 import socketserver
@@ -12,7 +13,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from uuid import uuid4
 
 EXIT_OK = 0
@@ -901,6 +902,32 @@ def run_differential(repo, scope, draft):
     return passed, steps, requires_attest
 
 
+def run_echo(repo, scope, draft):
+    request = draft["request"]
+    canary = secrets.token_hex(6)
+    payload = draft["payload_template"].replace("{CANARY}", canary)
+    url = request["url"].replace("{payload}", quote(payload, safe="")).replace("{payload_raw}", payload)
+    status, headers, body = guarded_fetch(repo, scope, request["method"], url, draft.get("session"), draft.get("headers"))
+    raw_present = payload in body
+    escapes = [f"&lt;hx{canary}", f"&#60;hx{canary}", f"&#x3c;hx{canary}"]
+    escaped_present = any(token in body for token in escapes)
+    index = body.find(payload)
+    snippet = body[max(0, index - 80): index + len(payload) + 80] if index >= 0 else ""
+    output_dir = repo.hunt / "FINDINGS" / "drafts" / draft["id"]
+    save_evidence(
+        repo,
+        output_dir,
+        {"kind": "verify", "step": "echo", "canary": canary},
+        {"method": request["method"], "url": url, "headers": {}, "body": None},
+        {"status": status, "headers": redact_headers(headers), "body": (redact_body(body) or "")[:8192],
+         "integrity": {"raw_sha256": hashlib.sha256((body or "").encode("utf-8", errors="ignore")).hexdigest(), "body_len": len(body or "")}},
+        {"canary": canary, "snippet": snippet},
+    )
+    steps = {"status": status, "canary": canary, "raw_present": raw_present, "escaped_present": escaped_present}
+    passed = 200 <= status < 300 and raw_present and not escaped_present
+    return passed, steps
+
+
 def run_attest(repo, draft, draft_path):
     if not stdin_is_tty():
         raise HxError("attest exige TTY interativo", EXIT_TTY)
@@ -945,13 +972,19 @@ def cmd_verify(args):
     scenario = draft.get("scenario")
     if scenario == "differential":
         passed, steps, requires_attest = run_differential(repo, scope, draft)
+    elif scenario == "echo":
+        passed, steps = run_echo(repo, scope, draft)
+        requires_attest = passed
     else:
         raise HxError(f"cenario nao suportado no v1: {scenario}", EXIT_GUARD)
     if passed and requires_attest:
         draft["pass_requires_attest"] = True
         draft["proof"] = steps
         dump_json(draft_path, draft)
-        print(f"{draft['id']}: PASS fraco (marker curto '{steps['victim']['marker']}') — assine com: hx verify {draft['id']} --attest")
+        if scenario == "echo":
+            print(f"{draft['id']}: PASS (canario {steps['canary']}) exige atestacao — assine com: hx verify {draft['id']} --attest")
+        else:
+            print(f"{draft['id']}: PASS fraco (marker curto '{steps['victim']['marker']}') — assine com: hx verify {draft['id']} --attest")
         return EXIT_OK
     if passed:
         draft["verified_at"] = now()
@@ -962,6 +995,8 @@ def cmd_verify(args):
         return EXIT_OK
     draft["failed_at"] = now()
     draft["fail_detail"] = steps
+    if scenario == "echo":
+        draft["fail_reason"] = "reflection_absent_or_escaped"
     dump_json(draft_path, draft)
     print(f"{draft['id']}: FAIL — {json.dumps(steps, ensure_ascii=False)}")
     return EXIT_OK
