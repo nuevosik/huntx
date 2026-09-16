@@ -384,6 +384,17 @@ def refute_gate(repo, hyp):
     return {"session_tag": tag, "checked_ts": now()}
 
 
+def coverage_counts(repo):
+    counts = {}
+    if repo.coverage.exists():
+        for line in repo.coverage.read_text().splitlines():
+            if line.startswith("|") and "---" not in line and "endpoint" not in line:
+                cells = [cell.strip() for cell in line.strip("|").split("|")]
+                if len(cells) >= 3:
+                    counts[cells[2]] = counts.get(cells[2], 0) + 1
+    return counts
+
+
 def cmd_brief(args):
     repo = repo_from_cwd()
     scope = repo.scope()
@@ -402,13 +413,7 @@ def cmd_brief(args):
     dead = [tag for tag, entry in health.items() if entry.get("dead_since")]
     if dead:
         parts.append("sessoes mortas: " + ", ".join(dead))
-    counts = {}
-    if repo.coverage.exists():
-        for line in repo.coverage.read_text().splitlines():
-            if line.startswith("|") and "---" not in line and "endpoint" not in line:
-                cells = [cell.strip() for cell in line.strip("|").split("|")]
-                if len(cells) >= 3:
-                    counts[cells[2]] = counts.get(cells[2], 0) + 1
+    counts = coverage_counts(repo)
     if counts:
         parts.append("coverage: " + " ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
     open_hyps = [h for h in hyps if h["status"] == "open"]
@@ -428,6 +433,96 @@ def cmd_brief(args):
     if len(text.encode("utf-8")) > limit:
         text = text.encode("utf-8")[:limit].decode("utf-8", errors="ignore") + "\n...[truncado]"
     print(text)
+
+
+def fmt_money(value):
+    return f"{value:.4f}".rstrip("0").rstrip(".") or "0"
+
+
+def read_runs(path, cutoff):
+    path = Path(path)
+    if not path.exists():
+        return []
+    records = []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict) and (record.get("ts") or 0) > cutoff:
+            records.append(record)
+    return records
+
+
+def cmd_debrief(args):
+    repo = repo_from_cwd()
+    with flock(repo.hunt / ".lock.debrief"):
+        sessions_dir = repo.hunt / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        date = time.strftime("%Y-%m-%d", time.localtime(now()))
+        existing = sorted(sessions_dir.glob("*.md"))
+        cutoff = max((path.stat().st_mtime for path in existing), default=0.0)
+        runs = read_runs(repo.hunt / "runs.jsonl", cutoff)
+        hyps, _ = load_hyps(repo)
+        closed = [hyp for hyp in hyps if (hyp.get("closed_ts") or 0) > cutoff]
+        groups = {}
+        for record in runs:
+            entry = groups.setdefault(record.get("hyp") or "-", {"runs": 0, "tokens": 0, "cost": 0.0})
+            entry["runs"] += 1
+            entry["tokens"] += record.get("tokens") or 0
+            if isinstance(record.get("cost"), (int, float)):
+                entry["cost"] += record["cost"]
+        open_hyps = [hyp for hyp in hyps if hyp.get("status") == "open"]
+        dropped = [hyp for hyp in hyps if hyp.get("status") == "dropped"]
+        lines = [f"# Debrief — {date}", "", "## Wave"]
+        lines.append(f"runs: {len(runs)} | tokens: {sum(entry['tokens'] for entry in groups.values())} | custo: {fmt_money(sum(entry['cost'] for entry in groups.values()))}")
+        for hid, entry in groups.items():
+            lines.append(f"- {hid}: runs {entry['runs']} | tokens: {entry['tokens']} | custo: {fmt_money(entry['cost'])}")
+        if not groups:
+            lines.append("- (nenhum run desde o ultimo debrief)")
+        lines.append("")
+        lines.append("## Vereditos")
+        for hyp in closed:
+            result = hyp.get("result") or {}
+            lines.append(f"- {hyp['id']}: {result.get('verdict') or '-'} — {result.get('note') or '-'}")
+        if not closed:
+            lines.append("- (nenhum veredito desde o ultimo debrief)")
+        lines.append("")
+        lines.append("## Coverage")
+        counts = coverage_counts(repo)
+        for status, count in sorted(counts.items()):
+            lines.append(f"- {status}: {count}")
+        if not counts:
+            lines.append("- (vazio)")
+        lines.append("")
+        lines.append("## Fila")
+        lines.append(f"abertas: {len(open_hyps)} | dropped: {len(dropped)}")
+        for hyp in open_hyps:
+            label = f"[{hyp['id']}]" + (" [planner]" if hyp.get("source") == "planner" else "")
+            lines.append(f"- {label} {hyp['claim'][:80]}")
+        for hyp in dropped:
+            lines.append(f"- {hyp['id']} dropped")
+        if not open_hyps and not dropped:
+            lines.append("- (fila vazia)")
+        lines.append("")
+        lines.append("## Observações")
+        notes = []
+        for record in runs:
+            hid = record.get("hyp") or "-"
+            if record.get("timeout"):
+                notes.append(f"- {hid}: timeout na fatia")
+            if record.get("reconciled"):
+                notes.append(f"- {hid}: reconciliado -> {record['reconciled']}")
+            stderr = " ".join((record.get("stderr") or "").split())
+            if stderr:
+                notes.append(f"- {hid}: stderr: {stderr[:160]}")
+        lines.extend(notes or ["- (nada)"])
+        number = sum(1 for path in existing if path.name.startswith(date + "-")) + 1
+        path = sessions_dir / f"{date}-{number:02d}.md"
+        atomic_write(path, "\n".join(lines) + "\n")
+    print(path.relative_to(repo.eng))
 
 
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
@@ -1223,6 +1318,7 @@ def main(argv=None):
     res_p.add_argument("--force", action="store_true")
     brief_p = sub.add_parser("brief")
     brief_p.add_argument("--max-bytes", dest="max_bytes", type=int, default=4000)
+    sub.add_parser("debrief")
     pending_p = sub.add_parser("pending")
     pending_sub = pending_p.add_subparsers(dest="pending_cmd", required=True)
     pending_sub.add_parser("list")
@@ -1270,6 +1366,8 @@ def main(argv=None):
             cmd_result(args)
         elif args.cmd == "brief":
             cmd_brief(args)
+        elif args.cmd == "debrief":
+            cmd_debrief(args)
         elif args.cmd == "pending":
             cmd_pending(args)
         elif args.cmd == "health":
