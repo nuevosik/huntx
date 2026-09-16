@@ -42,6 +42,22 @@ python3 runner/runner.py --engagement ~/hunts/target --slices 5 --wall 3600
 
 One worker, one slice at a time: claims from the queue, spawns `opencode run` with a `hunt-auto` agent injected inline via `OPENCODE_CONFIG_CONTENT` (no symlink, nothing written to your opencode config), adjudicates the draft with `hx verify` when one exists, then appends the slice record to `hunt/runs.jsonl`. Budgets: `--slices`, `--wall`, and the optional `--max-tokens`/`--max-cost` caps; the loop also stops on an empty queue. `touch hunt/runner.stop` is honored between slices and between retries — an in-flight attempt runs to its timeout, then the runner stops (SIGINT/SIGTERM request the same stop). Resume with `rm hunt/runner.stop`; the latch is also cleared at the next runner start.
 
+## Planner (opt-in)
+
+```bash
+python3 runner/runner.py --engagement ~/hunts/target --plan --plan-n 3
+```
+
+One headless planner session instead of a slice: it reads a digest (coverage, `TARGET.md`, last debrief, open queue, already-refuted pairs) and proposes up to `--plan-n` hypotheses with `--source planner` — it never touches the target. Proposals land in the queue marked `[planner]` in `hx next`/`hx brief`; the dj decides, and `hx hypothesis drop <id>` removes a proposal (a closed hypothesis needs `--force`). The record in `hunt/runs.jsonl` carries `mode: plan` and `proposed`.
+
+## Debrief
+
+```bash
+hx debrief   # same as /debrief in a session
+```
+
+Deterministic, no LLM: writes `hunt/sessions/YYYY-MM-DD-NN.md` from `runs.jsonl` + `HYPOTHESES.json` — runs/tokens/cost per hypothesis, verdicts, coverage counts, queue, and observation notes (timeouts, reconciliations) since the last debrief.
+
 ## Scope
 
 Not a sandbox. The tripwire blocks convenient paths, the guard is the only network exit for scripted traffic, and the proxy covers clients that honor `HTTP(S)_PROXY` — none of it replaces authorization and program rules. Authorized scope only.

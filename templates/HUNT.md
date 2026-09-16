@@ -40,3 +40,10 @@
 - Paradas: fila vazia, `--slices`/`--wall`/caps (`--max-tokens`, `--max-cost`) esgotados ou `runner.stop` presente.
 - Sessão morta (só com probes no scope e `session_tag` na hipótese): a hipótese fecha `blocked` e o runner segue.
 - Kill: `touch hunt/runner.stop` (honrado entre fatias e entre retries; a tentativa em voo roda até o timeout); SIGINT/SIGTERM no processo pedem a mesma parada. Retome com `rm hunt/runner.stop` — o start do próximo runner também limpa o latch.
+
+## Planner e debrief
+
+- Planner: `python3 runner/runner.py --engagement . --plan --plan-n N` — uma sessão headless que só propõe (não fala com o alvo); cap de N propostas (default 5); o digest traz coverage, `TARGET.md`, último debrief, fila aberta e já refutadas.
+- Proposta entra na fila com `source: planner` e aparece como `[planner]` no `hx next`/`hx brief`; o dj decide — `hx hypothesis drop <id>` (fechada exige `--force`).
+- O planner vira record em `hunt/runs.jsonl` com `mode: plan` e `proposed`.
+- Debrief: `/debrief` ou `hx debrief` escreve `hunt/sessions/AAAA-MM-DD-NN.md` determinístico — sem LLM, sem rede: runs/tokens/custo por hipótese, vereditos, coverage, fila e observações desde o debrief anterior.
