@@ -215,6 +215,11 @@ def run_slice(ctx):
     }
     if not ctx.get("no_adjudicate"):
         record["adjudication"] = adjudicate(repo, hyp["id"])
+    hyps, _ = hx.load_hyps(repo)
+    current = next((item for item in hyps if item["id"] == hyp["id"]), None)
+    if current and current.get("status") in ("claimed", "running"):
+        hx.main(["result", hyp["id"], "--verdict", "blocked", "--note", "fatia sem fechamento pelo worker", "--force"])
+        record["reconciled"] = "blocked"
     record_run(repo, record)
     return record
 
