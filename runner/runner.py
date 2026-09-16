@@ -99,8 +99,15 @@ def invoke_opencode(prompt, cwd, config_content, timeout_s, model=None, resume_s
     try:
         out, err = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        out, err = proc.communicate()
+        out, err = "", ""
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            out, err = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
         return (124, out or "", err or "")
     return (proc.returncode, out, err)
 
@@ -133,7 +140,7 @@ def retry_invoke(ctx, prompt):
     env_extra = {"HX_SESSION": owner} if owner else None
     rc, stdout, stderr = 1, "", ""
     while attempts < budget["backoff_attempts"]:
-        if attempts and ((ctx["repo"].hunt / "runner.stop").exists() or hx.now() - ctx["started_ts"] >= budget["wall_s"]):
+        if attempts and ((ctx["repo"].hunt / "runner.stop").exists() or hx.now() - ctx.get("started_ts", hx.now()) >= budget["wall_s"]):
             break
         attempts += 1
         rc, stdout, stderr = invoke_opencode(
@@ -247,10 +254,14 @@ def health_gate(hx_mod, repo, hyp):
         return False, tag
     fresh_s = float((scope.get("health") or {}).get("fresh_max_s", 600))
     if not hx_mod.health_fresh(repo, tag, fresh_s):
-        ok, sig = hx_mod.probe_once(repo, scope, tag)
-        declared = hx_mod.health_probe_result(repo, tag, ok, sig)
-        if declared:
-            hx_mod.reopen_sweep(repo, tag, hx_mod.health_get(repo, tag)["dead_since"])
+        try:
+            ok, sig = hx_mod.probe_once(repo, scope, tag)
+            declared = hx_mod.health_probe_result(repo, tag, ok, sig)
+            if declared:
+                hx_mod.reopen_sweep(repo, tag, hx_mod.health_get(repo, tag)["dead_since"])
+        except hx_mod.HxError as err:
+            print(f"runner: health probe falhou ({err})")
+            return True, tag
     if hx_mod.health_get(repo, tag).get("dead_since"):
         return False, tag
     return True, tag

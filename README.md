@@ -46,7 +46,7 @@ One worker, one slice at a time: claims from the queue, spawns `opencode run` wi
 
 ```bash
 python3 tests/test_hx.py                 # 90 tests, stdlib
-python3 tests/test_runner.py             # 33 tests, stdlib
+python3 tests/test_runner.py             # 47 tests, stdlib
 node --test tests/plugin_guard.test.mjs  # 10 tripwire tests
 ```
 
