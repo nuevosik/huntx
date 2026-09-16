@@ -496,12 +496,12 @@ def cmd_rate_reset(args):
     print("rate reiniciado — piso restaurado")
 
 
-HASH_HEADERS = re.compile(r"(?i)^(cookie|set-cookie|authorization)$")
+HASH_HEADERS = re.compile(r"(?i)^(cookie|set-cookie|authorization)$|token")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"\+?\d[\d\s().-]{8,}\d")
 PAN_RE = re.compile(r"\b\d{13,19}\b")
 SENSITIVE_PAIR_RE = re.compile(r"(?i)(password|passwd|secret|token|csrf|sessionid)=([^&\s\"']+)")
-SENSITIVE_JSON_RE = re.compile(r'(?i)("(?:password|passwd|secret|token|csrf|sessionid)"\s*:\s*")[^"]*(")')
+SENSITIVE_JSON_RE = re.compile(r'(?i)("(?:password|passwd|secret|token|csrf|sessionid)"\s*:\s*")([^"]*)(")')
 
 
 def sha12(value):
@@ -527,8 +527,8 @@ def redact_body(text):
     redacted = EMAIL_RE.sub("[email-redacted]", text)
     redacted = PHONE_RE.sub("[phone-redacted]", redacted)
     redacted = PAN_RE.sub("[pan-redacted]", redacted)
-    redacted = SENSITIVE_PAIR_RE.sub(r"\1=<redacted>", redacted)
-    return SENSITIVE_JSON_RE.sub(r"\1<redacted>\2", redacted)
+    redacted = SENSITIVE_PAIR_RE.sub(lambda m: f"{m.group(1)}={hash_or_drop(m.group(2))}", redacted)
+    return SENSITIVE_JSON_RE.sub(lambda m: m.group(1) + hash_or_drop(m.group(2)) + m.group(3), redacted)
 
 
 def extract_marker(pattern, text):
@@ -569,7 +569,7 @@ def save_evidence(repo, dir_path, meta, request, response, proof):
     dir_path.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%H%M%S", time.localtime(now()))
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", request["url"])[-80:]
-    path = dir_path / f"{stamp}_{request['method']}_{safe}.json"
+    path = dir_path / f"{stamp}_{request['method']}_{safe}_{uuid4().hex[:6]}.json"
     integrity = response.pop("integrity")
     record = {"meta": meta, "request": request, "response": response, "proof": proof, "integrity": integrity}
     atomic_write(path, json.dumps(record, indent=1, ensure_ascii=False))
