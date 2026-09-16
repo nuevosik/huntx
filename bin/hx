@@ -5,6 +5,9 @@ import hashlib
 import json
 import os
 import re
+import select
+import socket
+import socketserver
 import sys
 import time
 from contextlib import contextmanager
@@ -925,6 +928,74 @@ def cmd_verify(args):
     return EXIT_OK
 
 
+class ProxyHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        try:
+            first = self.request.recv(4096)
+            if not first:
+                return
+            line = first.split(b"\r\n", 1)[0].decode("latin-1")
+            parts = line.split()
+            if len(parts) < 2 or parts[0].upper() != "CONNECT":
+                self.request.sendall(b"HTTP/1.1 501 Not Implemented\r\n\r\n")
+                return
+            host_port = parts[1]
+            host = host_port.rsplit(":", 1)[0]
+            port = int(host_port.rsplit(":", 1)[1]) if ":" in host_port else 443
+            scope = self.server.scope
+            repo = self.server.repo
+            allowed, reason = check_scope(scope, f"https://{host}/")
+            if not allowed:
+                audit(repo, "proxy", "CONNECT", host_port, "denied", reason)
+                self.request.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                return
+            try:
+                rate_acquire(scope, repo, host, float(scope["rate"].get("max_wait_s", 30)))
+            except HxError as err:
+                self.request.sendall(f"HTTP/1.1 429 Too Many Requests\r\nX-Hx: {err}\r\n\r\n".encode())
+                return
+            upstream = socket.create_connection((host, port), timeout=15)
+            audit(repo, "proxy", "CONNECT", host_port, "allowed", "")
+            self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            sockets = [self.request, upstream]
+            try:
+                while True:
+                    readable, _, _ = select.select(sockets, [], [], 60)
+                    if not readable:
+                        break
+                    for source in readable:
+                        data = source.recv(65536)
+                        if not data:
+                            return
+                        target = upstream if source is self.request else self.request
+                        target.sendall(data)
+            finally:
+                upstream.close()
+        except Exception as err:
+            audit(self.server.repo, "proxy", "CONNECT", "", "error", str(err))
+
+
+def build_proxy(repo, scope, port):
+    class Server(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+
+    server = Server(("127.0.0.1", port), ProxyHandler)
+    server.repo = repo
+    server.scope = scope
+    return server
+
+
+def cmd_proxy(args):
+    repo = repo_from_cwd()
+    scope = repo.scope()
+    server = build_proxy(repo, scope, args.port)
+    print(f"hx proxy em 127.0.0.1:{server.server_address[1]}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="hx")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -983,6 +1054,8 @@ def main(argv=None):
     verify_p = sub.add_parser("verify")
     verify_p.add_argument("id")
     verify_p.add_argument("--attest", action="store_true")
+    proxy_p = sub.add_parser("proxy")
+    proxy_p.add_argument("--port", type=int, default=8899)
     args = parser.parse_args(argv)
     try:
         if args.cmd == "init":
@@ -1005,6 +1078,8 @@ def main(argv=None):
             return cmd_run(args)
         elif args.cmd == "verify":
             return cmd_verify(args)
+        elif args.cmd == "proxy":
+            return cmd_proxy(args)
         elif args.cmd == "rate":
             if args.rate_cmd == "show":
                 cmd_rate_show(args)
