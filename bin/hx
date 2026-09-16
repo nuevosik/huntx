@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from urllib.parse import urlparse
+
+EXIT_OK = 0
+EXIT_GUARD = 2
+EXIT_RATE = 3
+EXIT_TRANSPORT = 4
+EXIT_STAGED = 5
+EXIT_SESSION = 6
+EXIT_TTY = 7
+
+
+def now():
+    fake = os.environ.get("HX_FAKE_NOW")
+    return float(fake) if fake else time.time()
+
+
+sleep = time.sleep
+
+
+def stdin_is_tty():
+    return sys.stdin.isatty()
+
+
+def read_line(prompt):
+    return input(prompt)
+
+
+class HxError(Exception):
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
+def atomic_write(path, text):
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def load_json(path, default):
+    path = Path(path)
+    if not path.exists():
+        return default
+    return json.loads(path.read_text())
+
+
+def dump_json(path, data):
+    atomic_write(Path(path), json.dumps(data, indent=1, ensure_ascii=False))
+
+
+@contextmanager
+def flock(lock_path):
+    lock_path = Path(lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+
+
+def find_engagement(start=None):
+    env = os.environ.get("HX_ENGAGEMENT")
+    if env:
+        eng = Path(env).resolve()
+        if not (eng / "hunt" / "scope.json").exists():
+            raise HxError(f"HX_ENGAGEMENT sem hunt/scope.json: {eng}", EXIT_GUARD)
+        return eng
+    cur = Path(start or os.getcwd()).resolve()
+    for parent in [cur, *cur.parents]:
+        if (parent / "hunt" / "scope.json").exists():
+            return parent
+    raise HxError("engagement nao encontrado (hunt/scope.json)", EXIT_GUARD)
+
+
+class Repo:
+    def __init__(self, eng):
+        self.eng = Path(eng)
+        self.hunt = self.eng / "hunt"
+        self.hyps = self.hunt / "HYPOTHESES.json"
+        self.coverage = self.hunt / "COVERAGE.md"
+        self.scope_path = self.hunt / "scope.json"
+        self.health = self.hunt / ".health.json"
+        self.rate = self.hunt / ".ratelimit.json"
+
+    def scope(self):
+        return load_json(self.scope_path, {})
+
+
+def repo_from_cwd():
+    return Repo(find_engagement())
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="hx")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init")
+    args = parser.parse_args(argv)
+    try:
+        if args.cmd == "init":
+            print("not implemented")
+        return EXIT_OK
+    except HxError as err:
+        print(f"hx: {err}", file=sys.stderr)
+        return err.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
