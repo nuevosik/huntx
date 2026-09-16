@@ -67,7 +67,10 @@ export function extractHosts(command) {
 export function decideBash(scope, command) {
   if (!command) return { action: "allow", reason: "" };
   const trimmed = command.trim();
-  if (trimmed === "hx" || trimmed.startsWith("hx ")) return { action: "allow", reason: "hx path" };
+  const segments = trimmed.split(/[;\n]|&&|\|\|?/).map((segment) => segment.trim()).filter(Boolean);
+  if (segments.length > 0 && segments.every((segment) => segment === "hx" || segment.startsWith("hx "))) {
+    return { action: "allow", reason: "hx path" };
+  }
   const offenders = new Set();
   for (const host of extractHosts(trimmed)) {
     if (!hostAllowed(scope, host)) offenders.add(host);

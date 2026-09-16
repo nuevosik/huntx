@@ -167,6 +167,12 @@ def save_hyps(repo, hyps):
 
 def cmd_hypothesis_add(args):
     repo = repo_from_cwd()
+    scope = repo.scope()
+    probe_tags = [probe["session"] for probe in (scope.get("health") or {}).get("probes", [])]
+    if args.session_tag and not probe_tags:
+        raise HxError("--session-tag exige probes no scope (health.probes) para validar", EXIT_GUARD)
+    if args.session_tag and args.session_tag not in probe_tags:
+        raise HxError(f"session-tag '{args.session_tag}' nao bate com os probes ({', '.join(probe_tags)})", EXIT_GUARD)
     with flock(repo.hunt / ".lock.hyps"):
         hyps, _ = load_hyps(repo)
         hid = f"h{len(hyps) + 1:03d}"
@@ -781,6 +787,9 @@ def execute_request(repo, scope, method, url, session_path, body, marker, save_d
     host = urlparse(url).hostname or ""
     if session_path:
         tag = Path(session_path).stem.replace("session_", "")
+        probe_tags = [probe["session"] for probe in (scope.get("health") or {}).get("probes", [])]
+        if probe_tags and tag not in probe_tags:
+            raise HxError(f"sessao '{tag}' (de {session_path}) nao bate com os probes ({', '.join(probe_tags)}) — registre o probe ou renomeie o arquivo", EXIT_GUARD)
         if health_get(repo, tag).get("dead_since"):
             raise HxError(f"sessao {tag} morta — reautentique antes de usar", EXIT_SESSION)
     max_wait = float(scope["rate"].get("max_wait_s", 30))
@@ -845,7 +854,9 @@ def run_differential(repo, scope, draft):
         cookies = load_session(repo.eng / session_file)
         host = urlparse(url).hostname or ""
         rate_acquire(scope, repo, host, float(scope["rate"].get("max_wait_s", 30)))
-        return fetch(request["method"], url, None, None, cookies)
+        status, headers, body = fetch(request["method"], url, None, None, cookies)
+        apply_health_signals(repo, scope, host, status, headers, body)
+        return status, headers, body
 
     def substitute(url, mapping):
         for key, value in mapping.items():
@@ -1062,7 +1073,6 @@ def main(argv=None):
     rate_sub = rate_p.add_subparsers(dest="rate_cmd", required=True)
     rate_sub.add_parser("show")
     rate_reset_p = rate_sub.add_parser("reset")
-    rate_reset_p.add_argument("--to-floor", action="store_true")
     health_p = sub.add_parser("health")
     health_sub = health_p.add_subparsers(dest="health_cmd", required=True)
     health_check_p = health_sub.add_parser("check")
