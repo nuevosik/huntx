@@ -273,6 +273,8 @@ def cmd_result(args):
         hyp = next((h for h in hyps if h["id"] == args.id), None)
         if not hyp:
             raise HxError(f"hipotese nao encontrada: {args.id}", EXIT_GUARD)
+        if hyp["status"] == "result" and not args.force:
+            raise HxError("hipotese ja fechada (result) — use --force para refazer", EXIT_GUARD)
         if hyp["owner"] not in (session_tag(), None) and not args.force:
             raise HxError("nao e o dono (use --force)", EXIT_GUARD)
         if args.verdict == "confirmed":
@@ -290,8 +292,40 @@ def cmd_result(args):
     print(f"{hyp['id']} -> {args.verdict}")
 
 
+AUTH_FAIL_STATUSES = {401, 403}
+
+
+def evidence_auth_failure(repo, hyp):
+    evidence_dir = Path(hyp.get("evidence") or "")
+    if not evidence_dir.is_absolute():
+        evidence_dir = repo.eng / evidence_dir
+    if not evidence_dir.exists():
+        return False
+    files = sorted(evidence_dir.glob("*.json"), key=lambda path: path.stat().st_mtime)
+    if not files:
+        return False
+    record = load_json(files[-1], {})
+    return int((record.get("response") or {}).get("status", 0)) in AUTH_FAIL_STATUSES
+
+
 def refute_gate(repo, hyp):
-    return None
+    tag = hyp.get("session_tag")
+    if not tag or not evidence_auth_failure(repo, hyp):
+        return None
+    scope = repo.scope()
+    fresh_s = float(scope["health"].get("fresh_max_s", 600))
+    entry = health_get(repo, tag)
+    if entry.get("dead_since"):
+        raise HxError(f"sessao {tag} morta — use --verdict blocked", EXIT_SESSION)
+    if not health_fresh(repo, tag, fresh_s):
+        ok, signal = probe_once(repo, scope, tag)
+        declared = health_probe_result(repo, tag, ok, signal)
+        if declared:
+            reopened = reopen_sweep(repo, tag, health_get(repo, tag)["dead_since"])
+            raise HxError(f"sessao {tag} morreu no probe (reabertas: {', '.join(reopened) or 'nenhuma'}) — use --verdict blocked", EXIT_SESSION)
+        if not ok:
+            raise HxError(f"sessao {tag} suspeita ({signal}) — resolva antes de refutar", EXIT_SESSION)
+    return {"session_tag": tag, "checked_ts": now()}
 
 
 def cmd_brief(args):
