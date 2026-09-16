@@ -303,6 +303,11 @@ def cmd_result(args):
         session_check = None
         if args.verdict == "refuted":
             session_check = refute_gate(repo, hyp)
+        if args.verdict == "refuted" and not args.force:
+            draft_path = repo.hunt / "FINDINGS" / "drafts" / f"{hyp['id']}.json"
+            blocked_draft = load_json(draft_path, None)
+            if blocked_draft and blocked_draft.get("fail_reason") == "no_interaction_timeout":
+                raise HxError("timeout de callback nao refuta — use blocked/unverified, ou --force com prova de ausencia", EXIT_GUARD)
         hyp["status"] = "result"
         hyp["closed_ts"] = now()
         hyp["result"] = {"verdict": args.verdict, "note": args.note, "evidence": args.evidence, "session_check": session_check}
@@ -928,6 +933,56 @@ def run_echo(repo, scope, draft):
     return passed, steps
 
 
+def _parse_hits(body):
+    try:
+        data = json.loads(body or "[]")
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        rows = data.get("data") or []
+        return rows if isinstance(rows, list) else []
+    return data if isinstance(data, list) else []
+
+
+def _poll_for_new_hit(poll_url, base_count, interval_s, timeout_s):
+    max_polls = max(2, int(timeout_s / max(interval_s, 1)))
+    for _ in range(max_polls):
+        status, headers, body = fetch("GET", poll_url, {"Accept": "application/json"}, None, None)
+        hits = _parse_hits(body)
+        if len(hits) > base_count:
+            return hits
+        sleep(interval_s)
+    return None
+
+
+def run_callback(repo, scope, draft):
+    request = draft["request"]
+    collaborator = draft.get("collaborator") or {}
+    collaborator_url = collaborator.get("url") or ""
+    poll_url = (collaborator.get("poll") or {}).get("url") or ""
+    if not collaborator_url or not poll_url:
+        raise HxError("callback exige collaborator.url e collaborator.poll.url", EXIT_GUARD)
+    interval_s = float(draft.get("poll_interval_s", 3))
+    timeout_s = float(draft.get("interaction_timeout_s", 45))
+    snapshot_status, snapshot_headers, snapshot_body = fetch("GET", poll_url, {"Accept": "application/json"}, None, None)
+    base_count = len(_parse_hits(snapshot_body))
+    target_url = request["url"].replace("{collaborator}", collaborator_url)
+    status, headers, body = guarded_fetch(repo, scope, request["method"], target_url, draft.get("session"), draft.get("headers"))
+    hit = _poll_for_new_hit(poll_url, base_count, interval_s, timeout_s)
+    output_dir = repo.hunt / "FINDINGS" / "drafts" / draft["id"]
+    save_evidence(
+        repo,
+        output_dir,
+        {"kind": "verify", "step": "callback", "baseline_hits": base_count},
+        {"method": request["method"], "url": target_url, "headers": {}, "body": None},
+        {"status": status, "headers": redact_headers(headers), "body": (redact_body(body) or "")[:8192],
+         "integrity": {"raw_sha256": hashlib.sha256((body or "").encode("utf-8", errors="ignore")).hexdigest(), "body_len": len(body or "")}},
+        {"baseline_hits": base_count, "hit": (hit or [])[:1]},
+    )
+    steps = {"status": status, "baseline_hits": base_count, "interaction": hit is not None, "hit": (hit or [])[:1]}
+    return hit is not None, steps
+
+
 def run_attest(repo, draft, draft_path):
     if not stdin_is_tty():
         raise HxError("attest exige TTY interativo", EXIT_TTY)
@@ -975,6 +1030,9 @@ def cmd_verify(args):
     elif scenario == "echo":
         passed, steps = run_echo(repo, scope, draft)
         requires_attest = passed
+    elif scenario == "callback":
+        passed, steps = run_callback(repo, scope, draft)
+        requires_attest = False
     else:
         raise HxError(f"cenario nao suportado no v1: {scenario}", EXIT_GUARD)
     if passed and requires_attest:
@@ -993,6 +1051,8 @@ def cmd_verify(args):
         draft_path.unlink()
         print(f"{draft['id']}: PASS — {json.dumps(steps, ensure_ascii=False)}")
         return EXIT_OK
+    if scenario == "callback" and steps.get("interaction") is False:
+        draft["fail_reason"] = "no_interaction_timeout"
     draft["failed_at"] = now()
     draft["fail_detail"] = steps
     if scenario == "echo":
