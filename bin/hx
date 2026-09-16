@@ -610,6 +610,107 @@ def apply_health_signals(repo, scope, host, status, headers, body):
             return
 
 
+def health_load(repo):
+    return load_json(repo.health, {})
+
+
+def health_get(repo, tag):
+    default = {"strikes": 0, "first_strike": None, "dead_since": None, "suspect_since": None, "probes": []}
+    return health_load(repo).get(tag, default)
+
+
+def health_probe_result(repo, tag, ok, signal):
+    with flock(repo.hunt / ".lock.health"):
+        state = health_load(repo)
+        entry = state.setdefault(tag, {"strikes": 0, "first_strike": None, "dead_since": None, "suspect_since": None, "probes": []})
+        ts = now()
+        entry["probes"].append({"ts": ts, "ok": ok, "signal": signal})
+        declared = False
+        if ok:
+            entry["strikes"] = 0
+            entry["first_strike"] = None
+            entry["suspect_since"] = None
+        elif signal == "invalid":
+            if entry["strikes"] == 0:
+                entry["first_strike"] = ts
+            entry["strikes"] += 1
+            if entry["strikes"] >= 2 and not entry["dead_since"]:
+                entry["dead_since"] = entry["first_strike"]
+                declared = True
+        else:
+            entry["suspect_since"] = ts
+        dump_json(repo.health, state)
+    return declared
+
+
+def probe_once(repo, scope, tag):
+    probe = next((p for p in scope["health"]["probes"] if p["session"] == tag), None)
+    if probe is None:
+        raise HxError(f"sem probe definido para sessao {tag}", EXIT_GUARD)
+    cookies = load_session(repo.eng / probe["file"]) if probe.get("file") else []
+    host = urlparse(probe["url"]).hostname or ""
+    max_wait = float(scope["rate"].get("max_wait_s", 30))
+    rate_acquire(scope, repo, host, max_wait)
+    status, headers, body = fetch(probe["method"], probe["url"], None, None, cookies)
+    for sig in scope["health"]["rate_limited_if"]:
+        if signal_matches(sig, status, headers, body):
+            return False, "ratelimit"
+    for sig in scope["health"]["waf_block_if"]:
+        if signal_matches(sig, status, headers, body):
+            return False, "waf"
+    for sig in scope["health"]["session_invalid_if"]:
+        if signal_matches(sig, status, headers, body):
+            return False, "invalid"
+    return True, None
+
+
+def health_fresh(repo, tag, fresh_s):
+    probes = health_get(repo, tag).get("probes") or []
+    if not probes:
+        return False
+    last = probes[-1]
+    return bool(last.get("ok")) and (now() - last["ts"]) <= fresh_s
+
+
+def reopen_sweep(repo, tag, dead_since):
+    reopened = []
+    with flock(repo.hunt / ".lock.hyps"):
+        hyps, _ = load_hyps(repo)
+        for hyp in hyps:
+            if hyp.get("status") != "result":
+                continue
+            result = hyp.get("result") or {}
+            if result.get("verdict") != "refuted" or hyp.get("session_tag") != tag:
+                continue
+            if (hyp.get("closed_ts") or 0) >= dead_since:
+                hyp["status"] = "open"
+                hyp["owner"] = None
+                hyp["reopened_reason"] = "session_death_window"
+                reopened.append(hyp["id"])
+        if reopened:
+            save_hyps(repo, hyps)
+    return reopened
+
+
+def cmd_health_check(args):
+    repo = repo_from_cwd()
+    scope = repo.scope()
+    probes = scope["health"]["probes"]
+    tags = [args.session] if args.session and args.session != "all" else [p["session"] for p in probes]
+    for tag in tags:
+        ok, signal = probe_once(repo, scope, tag)
+        if signal == "ratelimit":
+            probe = next(p for p in probes if p["session"] == tag)
+            rate_step_up(scope, repo, urlparse(probe["url"]).hostname or "", "probe-429")
+        declared = health_probe_result(repo, tag, ok, signal)
+        print(f"{tag}: {'ok' if ok else signal}")
+        if declared:
+            entry = health_get(repo, tag)
+            reopened = reopen_sweep(repo, tag, entry["dead_since"])
+            print(f"{tag}: MORTA desde {entry['dead_since']} — reabertas: {', '.join(reopened) or 'nenhuma'}")
+    return EXIT_OK
+
+
 def execute_request(repo, scope, method, url, session_path, body, marker, save_dir, hypothesis, headers=None):
     host = urlparse(url).hostname or ""
     max_wait = float(scope["rate"].get("max_wait_s", 30))
@@ -699,6 +800,10 @@ def main(argv=None):
     rate_sub.add_parser("show")
     rate_reset_p = rate_sub.add_parser("reset")
     rate_reset_p.add_argument("--to-floor", action="store_true")
+    health_p = sub.add_parser("health")
+    health_sub = health_p.add_subparsers(dest="health_cmd", required=True)
+    health_check_p = health_sub.add_parser("check")
+    health_check_p.add_argument("--session", default="all")
     run_p = sub.add_parser("run")
     run_p.add_argument("method")
     run_p.add_argument("url")
@@ -725,6 +830,8 @@ def main(argv=None):
             cmd_brief(args)
         elif args.cmd == "pending":
             cmd_pending(args)
+        elif args.cmd == "health":
+            return cmd_health_check(args)
         elif args.cmd == "run":
             return cmd_run(args)
         elif args.cmd == "rate":
