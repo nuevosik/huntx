@@ -218,7 +218,7 @@ def cmd_release(args):
             hyp["owner"] = None
             hyp["claimed_ts"] = None
             save_hyps(repo, hyps)
-            print(f"released {hyp['id']}")
+            print(f"liberada {hyp['id']}")
             return
     raise HxError(f"hipotese nao encontrada: {args.id}", EXIT_GUARD)
 
