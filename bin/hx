@@ -812,6 +812,9 @@ def run_differential(repo, scope, draft):
     pattern = (draft.get("marker") or {}).get("extract")
 
     def call(session_file, url):
+        allowed, reason = check_scope(scope, url)
+        if not allowed:
+            raise HxError(f"guard: {reason}", EXIT_GUARD)
         cookies = load_session(repo.eng / session_file)
         host = urlparse(url).hostname or ""
         rate_acquire(scope, repo, host, float(scope["rate"].get("max_wait_s", 30)))
@@ -820,9 +823,6 @@ def run_differential(repo, scope, draft):
     def substitute(url, mapping):
         for key, value in mapping.items():
             url = url.replace("{" + key + "}", str(value))
-            victim_value = victim_object.get(key)
-            if victim_value is not None:
-                url = url.replace(str(victim_value), str(value))
         return url
 
     victim_url = substitute(url_template, victim_object)
@@ -873,6 +873,8 @@ def cmd_verify(args):
     if getattr(args, "attest", False):
         run_attest(repo, draft, draft_path)
         return EXIT_OK
+    if not draft.get("request"):
+        raise HxError(f"draft sem request: {args.id}", EXIT_GUARD)
     scenario = draft.get("scenario")
     if scenario == "differential":
         passed, steps, requires_attest = run_differential(repo, scope, draft)
