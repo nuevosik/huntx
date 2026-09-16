@@ -137,7 +137,7 @@ def build_plan_digest(repo, plan_n):
             if not line.startswith("|") or "---" in line:
                 continue
             cells = [cell.strip() for cell in line.strip("|").split("|")]
-            if len(cells) >= 3 and cells[2] == "refuted":
+            if len(cells) >= 3 and cells[2] == "refuted" and len(refuted_lines) < 100:
                 refuted_lines.append(f"- {cells[0]} | {cells[1]}")
     parts.extend(refuted_lines or ["(nenhuma)"])
     return "\n".join(parts)
@@ -392,20 +392,21 @@ def check_stop(ctx):
     return None
 
 
-def build_config_content(agent_md_path):
+def build_config_content(agent_md_path, plan=False):
     text = Path(agent_md_path).read_text()
     if text.startswith("---"):
         parts = text.split("---", 2)
         body = parts[2].strip() if len(parts) >= 3 else text
     else:
         body = text.strip()
+    bash = {"*": "deny", "hx hypothesis add *": "allow"} if plan else {"*": "deny", "hx *": "allow"}
     config = {
         "$schema": "https://opencode.ai/config.json",
         "agent": {
             "hunt-auto": {
                 "description": "headless hunt worker (runner)",
                 "mode": "primary",
-                "permission": {"bash": {"*": "deny", "hx *": "allow"}, "edit": "allow"},
+                "permission": {"bash": bash, "edit": "deny" if plan else "allow"},
                 "prompt": body,
             }
         },
@@ -448,7 +449,7 @@ def runner_main(argv=None):
     owner = f"runner-{os.getpid()}"
     os.environ["HX_SESSION"] = owner
     budget = {**DEFAULTS, "slices_max": args.slices, "wall_s": args.wall, "token_cap": args.max_tokens, "cost_cap": args.max_cost}
-    config = os.environ.get("RUNNER_CONFIG_CONTENT") or build_config_content(REPO_ROOT / "opencode" / "agents" / "hunt-auto.md")
+    config = os.environ.get("RUNNER_CONFIG_CONTENT") or build_config_content(REPO_ROOT / "opencode" / "agents" / "hunt-auto.md", plan=args.plan)
     ctx = {
         "repo": repo, "hyp": None, "brief": "", "config": config, "owner": owner,
         "model": args.model, "budget": budget, "started_ts": hx.now(), "slices_done": 0, "tokens_used": 0, "cost_used": 0,

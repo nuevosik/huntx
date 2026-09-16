@@ -469,7 +469,7 @@ def cmd_debrief(args):
         closed = [hyp for hyp in hyps if (hyp.get("closed_ts") or 0) > cutoff]
         groups = {}
         for record in runs:
-            entry = groups.setdefault(record.get("hyp") or "-", {"runs": 0, "tokens": 0, "cost": 0.0})
+            entry = groups.setdefault(record.get("hyp") or ("plan" if record.get("mode") == "plan" else "-"), {"runs": 0, "tokens": 0, "cost": 0.0})
             entry["runs"] += 1
             entry["tokens"] += record.get("tokens") or 0
             if isinstance(record.get("cost"), (int, float)):
