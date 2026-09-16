@@ -127,15 +127,133 @@ def cmd_init(args):
     print(f"engagement inicializado: {hunt}")
 
 
+TTL_CLAIM_S = 1800
+
+
+def session_tag():
+    return os.environ.get("HX_SESSION") or f"pid-{os.getpid()}"
+
+
+def load_hyps(repo):
+    hyps = load_json(repo.hyps, [])
+    t = now()
+    changed = False
+    for hyp in hyps:
+        if hyp.get("status") in ("claimed", "running") and (hyp.get("claimed_ts") or 0) + TTL_CLAIM_S < t:
+            hyp["status"] = "open"
+            hyp["owner"] = None
+            hyp["claimed_ts"] = None
+            hyp.setdefault("notes", []).append({"ts": t, "note": "claim TTL expirado; devolvido a open"})
+            changed = True
+    return hyps, changed
+
+
+def save_hyps(repo, hyps):
+    dump_json(repo.hyps, hyps)
+
+
+def cmd_hypothesis_add(args):
+    repo = repo_from_cwd()
+    with flock(repo.hunt / ".lock.hyps"):
+        hyps, _ = load_hyps(repo)
+        hid = f"h{len(hyps) + 1:03d}"
+        hyps.append({
+            "id": hid,
+            "status": "open",
+            "claim": args.claim,
+            "endpoint": args.endpoint,
+            "class": args.cls,
+            "confirm": args.confirm,
+            "refute": args.refute,
+            "evidence": args.evidence or f"scans/evidence/{hid}",
+            "session_tag": args.session_tag,
+            "owner": None,
+            "created_ts": now(),
+            "claimed_ts": None,
+            "closed_ts": None,
+            "result": {"verdict": None, "note": None, "evidence": None},
+            "reopened_reason": None,
+        })
+        save_hyps(repo, hyps)
+    print(hid)
+
+
+def cmd_next(args):
+    repo = repo_from_cwd()
+    owner = session_tag()
+    picked = []
+    with flock(repo.hunt / ".lock.hyps"):
+        hyps, _ = load_hyps(repo)
+        for hyp in hyps:
+            if len(picked) >= args.n:
+                break
+            if hyp["status"] != "open":
+                continue
+            if not args.peek:
+                hyp["status"] = "claimed"
+                hyp["owner"] = owner
+                hyp["claimed_ts"] = now()
+            picked.append(hyp)
+        save_hyps(repo, hyps)
+    for hyp in picked:
+        print(f"[{hyp['id']}] {hyp['claim']}")
+        print(f"  endpoint: {hyp['endpoint']} | classe: {hyp['class']}")
+        print(f"  confirm: {hyp['confirm']}")
+        print(f"  refute:  {hyp['refute']}")
+        print(f"  evidencia: {hyp['evidence']}")
+        print(f"  sessao: {hyp['session_tag'] or '-'}")
+        print()
+
+
+def cmd_release(args):
+    repo = repo_from_cwd()
+    with flock(repo.hunt / ".lock.hyps"):
+        hyps, _ = load_hyps(repo)
+        for hyp in hyps:
+            if hyp["id"] != args.id:
+                continue
+            if hyp["owner"] not in (session_tag(), None) and not args.force:
+                raise HxError("nao e o dono (use --force)", EXIT_GUARD)
+            hyp["status"] = "open"
+            hyp["owner"] = None
+            hyp["claimed_ts"] = None
+            save_hyps(repo, hyps)
+            print(f"released {hyp['id']}")
+            return
+    raise HxError(f"hipotese nao encontrada: {args.id}", EXIT_GUARD)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="hx")
     sub = parser.add_subparsers(dest="cmd", required=True)
     init_p = sub.add_parser("init")
     init_p.add_argument("--dir", default=".")
+    hyp_p = sub.add_parser("hypothesis")
+    hyp_sub = hyp_p.add_subparsers(dest="hyp_cmd", required=True)
+    add_p = hyp_sub.add_parser("add")
+    add_p.add_argument("--claim", required=True)
+    add_p.add_argument("--endpoint", required=True)
+    add_p.add_argument("--class", dest="cls", required=True)
+    add_p.add_argument("--confirm", required=True)
+    add_p.add_argument("--refute", required=True)
+    add_p.add_argument("--evidence")
+    add_p.add_argument("--session-tag", dest="session_tag")
+    next_p = sub.add_parser("next")
+    next_p.add_argument("n", nargs="?", type=int, default=3)
+    next_p.add_argument("--peek", action="store_true")
+    rel_p = sub.add_parser("release")
+    rel_p.add_argument("id")
+    rel_p.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.cmd == "init":
             cmd_init(args)
+        elif args.cmd == "hypothesis":
+            cmd_hypothesis_add(args)
+        elif args.cmd == "next":
+            cmd_next(args)
+        elif args.cmd == "release":
+            cmd_release(args)
         return EXIT_OK
     except HxError as err:
         print(f"hx: {err}", file=sys.stderr)
