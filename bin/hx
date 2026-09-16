@@ -410,7 +410,26 @@ def cmd_pending(args):
 
 
 def cmd_pending_run(repo, pending_id):
-    raise HxError("pending run chega na Task 7", EXIT_GUARD)
+    if not stdin_is_tty():
+        raise HxError("pending run exige TTY interativo", EXIT_TTY)
+    path = repo.hunt / "pending" / f"{pending_id}.json"
+    record = load_json(path, None)
+    if record is None:
+        raise HxError(f"pending nao encontrado: {pending_id}", EXIT_GUARD)
+    scope = repo.scope()
+    ok, reason = check_scope(scope, record["url"])
+    if not ok:
+        audit(repo, "dj", "pending run", record["url"], "refused", reason)
+        raise HxError(f"pending agora fora do escopo: {reason}", EXIT_GUARD)
+    host = urlparse(record["url"]).hostname or ""
+    typed = read_line(f"digite o host para confirmar ({host}): ")
+    if typed.strip() != host:
+        raise HxError("confirmacao nao confere; abortado", EXIT_GUARD)
+    execute_request(repo, scope, record["method"], record["url"], record.get("session"), record.get("body"), record.get("marker"), "scans/evidence/_pending", None, record.get("headers"))
+    audit(repo, "dj", "pending run", record["url"], "executed", host)
+    path.unlink()
+    print("executado e removido da fila de pendentes")
+    return EXIT_OK
 
 
 def rate_effective_interval(scope, state, host):
@@ -477,6 +496,168 @@ def cmd_rate_reset(args):
     print("rate reiniciado — piso restaurado")
 
 
+HASH_HEADERS = re.compile(r"(?i)^(cookie|set-cookie|authorization)$")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+PHONE_RE = re.compile(r"\+?\d[\d\s().-]{8,}\d")
+PAN_RE = re.compile(r"\b\d{13,19}\b")
+SENSITIVE_PAIR_RE = re.compile(r"(?i)(password|passwd|secret|token|csrf|sessionid)=([^&\s\"']+)")
+SENSITIVE_JSON_RE = re.compile(r'(?i)("(?:password|passwd|secret|token|csrf|sessionid)"\s*:\s*")[^"]*(")')
+
+
+def sha12(value):
+    return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
+def hash_or_drop(value):
+    if len(value) >= 16:
+        return f"sha256:{sha12(value)}"
+    return "<dropped>"
+
+
+def redact_headers(headers):
+    out = {}
+    for name, value in (headers or {}).items():
+        out[name] = hash_or_drop(str(value)) if HASH_HEADERS.search(name) else str(value)
+    return out
+
+
+def redact_body(text):
+    if not text:
+        return text
+    redacted = EMAIL_RE.sub("[email-redacted]", text)
+    redacted = PHONE_RE.sub("[phone-redacted]", redacted)
+    redacted = PAN_RE.sub("[pan-redacted]", redacted)
+    redacted = SENSITIVE_PAIR_RE.sub(r"\1=<redacted>", redacted)
+    return SENSITIVE_JSON_RE.sub(r"\1<redacted>\2", redacted)
+
+
+def extract_marker(pattern, text):
+    if not pattern or not text:
+        return None
+    match = re.search(pattern, text)
+    if not match:
+        return None
+    return match.group(1) if match.groups() else match.group(0)
+
+
+def load_session(path):
+    if not path:
+        return []
+    return load_json(Path(path), [])
+
+
+def fetch(method, url, headers=None, body=None, cookies=None):
+    from curl_cffi import requests as creq
+    session = creq.Session(impersonate="chrome131")
+    for cookie in cookies or []:
+        session.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain", ""), path=cookie.get("path", "/"))
+    response = session.request(method, url, headers=headers or {}, data=body, timeout=30, allow_redirects=False)
+    return response.status_code, dict(response.headers), response.text
+
+
+def audit(repo, actor, tool, payload, verdict, reason):
+    entry = json.dumps({"ts": now(), "actor": actor, "tool": tool, "payload": (payload or "")[:200], "verdict": verdict, "reason": reason}, ensure_ascii=False)
+    with flock(repo.hunt / ".lock.audit"):
+        with open(repo.hunt / "audit.log", "a") as handle:
+            handle.write(entry + "\n")
+
+
+def save_evidence(repo, dir_path, meta, request, response, proof):
+    dir_path = Path(dir_path)
+    if not dir_path.is_absolute():
+        dir_path = repo.eng / dir_path
+    dir_path.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%H%M%S", time.localtime(now()))
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", request["url"])[-80:]
+    path = dir_path / f"{stamp}_{request['method']}_{safe}.json"
+    integrity = response.pop("integrity")
+    record = {"meta": meta, "request": request, "response": response, "proof": proof, "integrity": integrity}
+    atomic_write(path, json.dumps(record, indent=1, ensure_ascii=False))
+    return path
+
+
+def signal_matches(sig, status, headers, body):
+    if sig.startswith("status:"):
+        return status == int(sig.split(":", 1)[1])
+    if sig.startswith("redirect_host:"):
+        location = headers.get("location") or headers.get("Location") or ""
+        return sig.split(":", 1)[1] in location
+    if sig.startswith("body_contains:"):
+        return sig.split(":", 1)[1] in (body or "")
+    return False
+
+
+def parse_headers(pairs):
+    headers = {}
+    for pair in pairs or []:
+        name, _, value = pair.partition(":")
+        if name.strip():
+            headers[name.strip()] = value.strip()
+    return headers or None
+
+
+def apply_health_signals(repo, scope, host, status, headers, body):
+    health_cfg = scope.get("health", {})
+    for sig in health_cfg.get("rate_limited_if", []):
+        if signal_matches(sig, status, headers, body):
+            rate_step_up(scope, repo, host, f"http-{status}")
+            audit(repo, "hx run", "health", host, "step-up", sig)
+            return
+    for sig in health_cfg.get("waf_block_if", []):
+        if signal_matches(sig, status, headers, body):
+            rate_step_up(scope, repo, host, "waf-marker")
+            audit(repo, "hx run", "health", host, "step-up", sig)
+            return
+
+
+def execute_request(repo, scope, method, url, session_path, body, marker, save_dir, hypothesis, headers=None):
+    host = urlparse(url).hostname or ""
+    max_wait = float(scope["rate"].get("max_wait_s", 30))
+    rate_acquire(scope, repo, host, max_wait)
+    cookies = load_session(repo.eng / session_path) if session_path else []
+    status, resp_headers, text = fetch(method, url, headers, body, cookies)
+    apply_health_signals(repo, scope, host, status, resp_headers, text)
+    raw_hash = hashlib.sha256((text or "").encode("utf-8", errors="ignore")).hexdigest()
+    proof = {"marker": extract_marker(marker, text)} if marker else {}
+    request_record = {"method": method, "url": url, "headers": redact_headers(headers or {}), "body": redact_body(body) if body else None}
+    response_record = {
+        "status": status,
+        "headers": redact_headers(resp_headers),
+        "body": (redact_body(text) or "")[:8192],
+        "integrity": {"raw_sha256": raw_hash, "body_len": len(text or "")},
+    }
+    meta = {"ts": now(), "session": session_path, "hypothesis": hypothesis, "status": status}
+    path = save_evidence(repo, save_dir, meta, request_record, response_record, proof)
+    return status, resp_headers, text, path
+
+
+def cmd_run(args):
+    repo = repo_from_cwd()
+    scope = repo.scope()
+    headers = parse_headers(args.header)
+    ok, reason = check_scope(scope, args.url)
+    if not ok:
+        raise HxError(f"guard: {reason}", EXIT_GUARD)
+    if classify_method(scope, args.method, args.url) == "staged":
+        pending_id = stage_pending(repo, {
+            "method": args.method.upper(),
+            "url": args.url,
+            "body": args.data,
+            "headers": headers,
+            "session": args.session,
+            "marker": args.marker,
+        })
+        print(f"staged: hunt/pending/{pending_id}.json — dj executa: hx pending run {pending_id}")
+        return EXIT_STAGED
+    save_dir = args.save or "scans/evidence/_misc"
+    status, _, _, path = execute_request(repo, scope, args.method.upper(), args.url, args.session, args.data, args.marker, save_dir, args.hypothesis, headers)
+    print(f"{status} {args.method.upper()} {args.url}")
+    print(f"evidence: {path.relative_to(repo.eng)}")
+    if args.json_out:
+        print(json.dumps({"status": status, "evidence": str(path.relative_to(repo.eng))}, ensure_ascii=False))
+    return EXIT_OK
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="hx")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -518,6 +699,16 @@ def main(argv=None):
     rate_sub.add_parser("show")
     rate_reset_p = rate_sub.add_parser("reset")
     rate_reset_p.add_argument("--to-floor", action="store_true")
+    run_p = sub.add_parser("run")
+    run_p.add_argument("method")
+    run_p.add_argument("url")
+    run_p.add_argument("--session")
+    run_p.add_argument("--data")
+    run_p.add_argument("--header", action="append")
+    run_p.add_argument("--save")
+    run_p.add_argument("--marker")
+    run_p.add_argument("--hypothesis")
+    run_p.add_argument("--json", dest="json_out", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.cmd == "init":
@@ -534,6 +725,8 @@ def main(argv=None):
             cmd_brief(args)
         elif args.cmd == "pending":
             cmd_pending(args)
+        elif args.cmd == "run":
+            return cmd_run(args)
         elif args.cmd == "rate":
             if args.rate_cmd == "show":
                 cmd_rate_show(args)
