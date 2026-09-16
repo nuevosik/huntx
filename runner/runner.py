@@ -84,6 +84,70 @@ def build_prompt(hyp, brief_text, slice_timeout_s):
     )
 
 
+PLAN_TEMPLATE = """Você é o PLANEJADOR desta sessão. Sua única função é propor hipóteses para a fila — você não testa nada.
+
+PROIBIDO: rodar `hx run` ou qualquer request de rede contra o alvo. Você não interage com o alvo.
+
+CAP: proponha no máximo {n} hipóteses novas nesta sessão.
+DEDUP: não repita nada que já esteja na fila aberta ou na lista de já refutadas do digest.
+
+DIGEST:
+{digest}
+
+COMO REGISTRAR: cada proposta deve virar um comando
+`hx hypothesis add --claim "..." --endpoint "..." --class "..." --confirm "..." --refute "..." --source planner`
+um comando por proposta, sem --session-tag.
+
+Feche com um resumo curto: quantas propostas registrou e por quê."""
+
+PLAN_DIGEST_BYTES = 3072
+
+
+def build_plan_digest(repo, plan_n):
+    parts = [f"== DIGEST DE PLANEJAMENTO == (cap de propostas: {plan_n})", ""]
+    parts.append("## Coverage (truncado em 3KB)")
+    coverage = repo.coverage.read_text() if repo.coverage.exists() else ""
+    coverage = coverage.encode("utf-8")[:PLAN_DIGEST_BYTES].decode("utf-8", errors="ignore")
+    parts.append(coverage or "(vazio)")
+    parts.append("")
+    parts.append("## TARGET.md (60 linhas)")
+    target = repo.hunt / "TARGET.md"
+    target_lines = target.read_text().splitlines()[:60] if target.exists() else []
+    parts.extend(target_lines or ["(vazio)"])
+    parts.append("")
+    parts.append("## Último debrief (40 linhas)")
+    sessions_dir = repo.hunt / "sessions"
+    sessions = sorted(sessions_dir.glob("*.md")) if sessions_dir.exists() else []
+    parts.extend(sessions[-1].read_text().splitlines()[-40:] if sessions else ["(nenhum)"])
+    parts.append("")
+    hyps, _ = hx.load_hyps(repo)
+    parts.append("## Fila aberta")
+    open_lines = []
+    for hyp in hyps:
+        if hyp.get("status") != "open":
+            continue
+        label = f"[{hyp['id']}]" + (" [planner]" if hyp.get("source") == "planner" else "")
+        open_lines.append(f"- {label} {hyp['claim']} ({hyp['class']} {hyp['endpoint']})")
+    parts.extend(open_lines or ["(vazia)"])
+    parts.append("")
+    parts.append("## Já refutadas (endpoint | classe)")
+    refuted_lines = []
+    if repo.coverage.exists():
+        for line in repo.coverage.read_text().splitlines():
+            if not line.startswith("|") or "---" in line:
+                continue
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if len(cells) >= 3 and cells[2] == "refuted":
+                refuted_lines.append(f"- {cells[0]} | {cells[1]}")
+    parts.extend(refuted_lines or ["(nenhuma)"])
+    return "\n".join(parts)
+
+
+def count_planner_hyps(repo):
+    hyps, _ = hx.load_hyps(repo)
+    return sum(1 for hyp in hyps if hyp.get("source") == "planner")
+
+
 def invoke_opencode(prompt, cwd, config_content, timeout_s, model=None, resume_session=None, env_extra=None):
     env = dict(os.environ)
     env["OPENCODE_CONFIG_CONTENT"] = config_content
@@ -244,6 +308,28 @@ def run_slice(ctx):
     return record
 
 
+def run_plan(ctx):
+    repo = ctx["repo"]
+    plan_n = ctx.get("plan_n") or 5
+    prompt = PLAN_TEMPLATE.format(digest=build_plan_digest(repo, plan_n), n=plan_n)
+    before = count_planner_hyps(repo)
+    rc, stdout, _, _ = retry_invoke(ctx, prompt)
+    session = parse_session_id(stdout)
+    usage = export_usage(hx, session) if session else {}
+    record = {
+        "ts": hx.now(),
+        "mode": "plan",
+        "session": session,
+        "rc": rc,
+        "tokens": usage.get("tokens"),
+        "cost": usage.get("cost"),
+        "proposed": count_planner_hyps(repo) - before,
+    }
+    record_run(repo, record)
+    print(f"planner: +{record['proposed']} propostas (session {session or '-'}, tokens {record['tokens'] or 0})")
+    return record
+
+
 def health_gate(hx_mod, repo, hyp):
     scope = repo.scope()
     probes = (scope.get("health") or {}).get("probes") or []
@@ -335,6 +421,8 @@ def runner_main(argv=None):
     parser.add_argument("--wall", type=int, default=DEFAULTS["wall_s"])
     parser.add_argument("--model", default=None)
     parser.add_argument("--no-adjudicate", action="store_true")
+    parser.add_argument("--plan", action="store_true")
+    parser.add_argument("--plan-n", dest="plan_n", type=int, default=5)
     parser.add_argument("--max-tokens", dest="max_tokens", type=int, default=None)
     parser.add_argument("--max-cost", dest="max_cost", type=float, default=None)
     args = parser.parse_args(argv)
@@ -364,11 +452,14 @@ def runner_main(argv=None):
     ctx = {
         "repo": repo, "hyp": None, "brief": "", "config": config, "owner": owner,
         "model": args.model, "budget": budget, "started_ts": hx.now(), "slices_done": 0, "tokens_used": 0, "cost_used": 0,
-        "no_adjudicate": args.no_adjudicate,
+        "no_adjudicate": args.no_adjudicate, "plan_n": args.plan_n,
     }
     try:
         write_pid(repo)
         install_signals(ctx)
+        if args.plan:
+            run_plan(ctx)
+            return 0
         while True:
             reason = check_stop(ctx)
             if reason:
