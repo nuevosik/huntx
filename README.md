@@ -42,14 +42,6 @@ python3 runner/runner.py --engagement ~/hunts/target --slices 5 --wall 3600
 
 One worker, one slice at a time: claims from the queue, spawns `opencode run` with a `hunt-auto` agent injected inline via `OPENCODE_CONFIG_CONTENT` (no symlink, nothing written to your opencode config), adjudicates the draft with `hx verify` when one exists, then appends the slice record to `hunt/runs.jsonl`. Budgets: `--slices`, `--wall`, and the optional `--max-tokens`/`--max-cost` caps; the loop also stops on an empty queue. `touch hunt/runner.stop` is honored between slices and between retries — an in-flight attempt runs to its timeout, then the runner stops (SIGINT/SIGTERM request the same stop). Resume with `rm hunt/runner.stop`; the latch is also cleared at the next runner start.
 
-## Tests
-
-```bash
-python3 tests/test_hx.py                 # 90 tests, stdlib
-python3 tests/test_runner.py             # 47 tests, stdlib
-node --test tests/plugin_guard.test.mjs  # 10 tripwire tests
-```
-
 ## Scope
 
 Not a sandbox. The tripwire blocks convenient paths, the guard is the only network exit for scripted traffic, and the proxy covers clients that honor `HTTP(S)_PROXY` — none of it replaces authorization and program rules. Authorized scope only.
