@@ -936,14 +936,15 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 return
             line = first.split(b"\r\n", 1)[0].decode("latin-1")
             parts = line.split()
+            scope = self.server.scope
+            repo = self.server.repo
             if len(parts) < 2 or parts[0].upper() != "CONNECT":
+                audit(repo, "proxy", "CONNECT", line[:120], "denied", "nao-CONNECT")
                 self.request.sendall(b"HTTP/1.1 501 Not Implemented\r\n\r\n")
                 return
             host_port = parts[1]
             host = host_port.rsplit(":", 1)[0]
             port = int(host_port.rsplit(":", 1)[1]) if ":" in host_port else 443
-            scope = self.server.scope
-            repo = self.server.repo
             allowed, reason = check_scope(scope, f"https://{host}/")
             if not allowed:
                 audit(repo, "proxy", "CONNECT", host_port, "denied", reason)
@@ -952,13 +953,14 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             try:
                 rate_acquire(scope, repo, host, float(scope["rate"].get("max_wait_s", 30)))
             except HxError as err:
+                audit(repo, "proxy", "CONNECT", host_port, "rate", str(err))
                 self.request.sendall(f"HTTP/1.1 429 Too Many Requests\r\nX-Hx: {err}\r\n\r\n".encode())
                 return
             upstream = socket.create_connection((host, port), timeout=15)
-            audit(repo, "proxy", "CONNECT", host_port, "allowed", "")
-            self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            sockets = [self.request, upstream]
             try:
+                audit(repo, "proxy", "CONNECT", host_port, "allowed", "")
+                self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                sockets = [self.request, upstream]
                 while True:
                     readable, _, _ = select.select(sockets, [], [], 60)
                     if not readable:
