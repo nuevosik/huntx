@@ -46,4 +46,4 @@
 - Planner: `python3 runner/runner.py --engagement . --plan --plan-n N` — uma sessão headless que só propõe (não fala com o alvo); cap de N propostas (default 5); o digest traz coverage, `TARGET.md`, último debrief, fila aberta e já refutadas.
 - Proposta entra na fila com `source: planner` e aparece como `[planner]` no `hx next`/`hx brief`; o dj decide — `hx hypothesis drop <id>` (fechada exige `--force`).
 - O planner vira record em `hunt/runs.jsonl` com `mode: plan` e `proposed`.
-- Debrief: `/debrief` ou `hx debrief` escreve `hunt/sessions/AAAA-MM-DD-NN.md` determinístico — sem LLM, sem rede: runs/tokens/custo por hipótese, vereditos, coverage, fila e observações desde o debrief anterior.
+- Debrief: `/debrief` (na sessão, manual) ou `hx debrief` (determinístico, sem LLM/rede): escreve `hunt/sessions/AAAA-MM-DD-NN.md` — runs/tokens/custo por hipótese, vereditos, coverage, fila e observações desde o debrief anterior.

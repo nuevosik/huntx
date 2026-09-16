@@ -48,15 +48,15 @@ One worker, one slice at a time: claims from the queue, spawns `opencode run` wi
 python3 runner/runner.py --engagement ~/hunts/target --plan --plan-n 3
 ```
 
-One headless planner session instead of a slice: it reads a digest (coverage, `TARGET.md`, last debrief, open queue, already-refuted pairs) and proposes up to `--plan-n` hypotheses with `--source planner` — it never touches the target. Proposals land in the queue marked `[planner]` in `hx next`/`hx brief`; the dj decides, and `hx hypothesis drop <id>` removes a proposal (a closed hypothesis needs `--force`). The record in `hunt/runs.jsonl` carries `mode: plan` and `proposed`.
+One headless planner session instead of a slice: it reads a digest (coverage, `TARGET.md`, last debrief, open queue, already-refuted pairs) and proposes up to `--plan-n` hypotheses with `--source planner` — it never touches the target. Proposals land in the queue marked `[planner]` in `hx next`/`hx brief`; the operator decides, and `hx hypothesis drop <id>` removes a proposal (a closed hypothesis needs `--force`). The record in `hunt/runs.jsonl` carries `mode: plan` and `proposed`.
 
 ## Debrief
 
 ```bash
-hx debrief   # same as /debrief in a session
+hx debrief   # CLI twin of /debrief (deterministic, no LLM)
 ```
 
-Deterministic, no LLM: writes `hunt/sessions/YYYY-MM-DD-NN.md` from `runs.jsonl` + `HYPOTHESES.json` — runs/tokens/cost per hypothesis, verdicts, coverage counts, queue, and observation notes (timeouts, reconciliations) since the last debrief.
+Deterministic, no LLM: writes `hunt/sessions/YYYY-MM-DD-NN.md` from `runs.jsonl`, `HYPOTHESES.json`, `COVERAGE.md` and the existing session files (numbering + cutoff) — runs/tokens/cost per hypothesis, verdicts, coverage counts, queue, and observation notes (timeouts, reconciliations) since the last debrief.
 
 ## Scope
 
