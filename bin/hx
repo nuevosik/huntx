@@ -912,13 +912,16 @@ def run_echo(repo, scope, draft):
     if "{CANARY}" not in template:
         raise HxError("payload_template precisa conter {CANARY}", EXIT_GUARD)
     request = draft["request"]
+    if "{payload}" not in request["url"] and "{payload_raw}" not in request["url"]:
+        raise HxError("request.url precisa conter {payload} ou {payload_raw}", EXIT_GUARD)
     canary = secrets.token_hex(6)
     payload = template.replace("{CANARY}", canary)
     url = request["url"].replace("{payload}", quote(payload, safe="")).replace("{payload_raw}", payload)
     status, headers, body = guarded_fetch(repo, scope, request["method"], url, draft.get("session"), draft.get("headers"))
+    lowered_body = body.lower()
     raw_present = payload in body
     escapes = [f"&lt;hx{canary}", f"&#60;hx{canary}", f"&#x3c;hx{canary}"]
-    escaped_present = any(token in body for token in escapes)
+    escaped_present = any(token in lowered_body for token in escapes)
     index = body.find(payload)
     snippet = body[max(0, index - 80): index + len(payload) + 80] if index >= 0 else ""
     output_dir = repo.hunt / "FINDINGS" / "drafts" / draft["id"]
@@ -947,14 +950,14 @@ def _parse_hits(body):
     return data if isinstance(data, list) else []
 
 
-def _poll_for_new_hit(poll_url, base_count, interval_s, timeout_s):
-    max_polls = max(2, int(timeout_s / max(interval_s, 1)))
-    for _ in range(max_polls):
+def _poll_for_new_hit(poll_url, base_count, interval_s, max_polls):
+    for attempt in range(max_polls):
         status, headers, body = fetch("GET", poll_url, {"Accept": "application/json"}, None, None)
         hits = _parse_hits(body)
         if len(hits) > base_count:
             return hits
-        sleep(interval_s)
+        if attempt < max_polls - 1:
+            sleep(interval_s)
     return None
 
 
@@ -967,11 +970,25 @@ def run_callback(repo, scope, draft):
         raise HxError("callback exige collaborator.url e collaborator.poll.url", EXIT_GUARD)
     interval_s = float(draft.get("poll_interval_s", 3))
     timeout_s = float(draft.get("interaction_timeout_s", 45))
+    interval_s = min(max(interval_s, 1.0), max(timeout_s, 1.0))
+    max_polls = max(1, int(timeout_s / interval_s))
     snapshot_status, snapshot_headers, snapshot_body = fetch("GET", poll_url, {"Accept": "application/json"}, None, None)
-    base_count = len(_parse_hits(snapshot_body))
+    if not (200 <= snapshot_status < 300):
+        raise HxError(f"snapshot do colaborador falhou: status {snapshot_status}", EXIT_TRANSPORT)
+    try:
+        snapshot_data = json.loads(snapshot_body or "[]")
+    except Exception:
+        raise HxError("snapshot do colaborador nao e JSON valido", EXIT_TRANSPORT)
+    if isinstance(snapshot_data, dict):
+        snapshot_rows = snapshot_data.get("data") or []
+    elif isinstance(snapshot_data, list):
+        snapshot_rows = snapshot_data
+    else:
+        snapshot_rows = []
+    base_count = len(snapshot_rows) if isinstance(snapshot_rows, list) else 0
     target_url = request["url"].replace("{collaborator}", collaborator_url)
     status, headers, body = guarded_fetch(repo, scope, request["method"], target_url, draft.get("session"), draft.get("headers"))
-    hit = _poll_for_new_hit(poll_url, base_count, interval_s, timeout_s)
+    hit = _poll_for_new_hit(poll_url, base_count, interval_s, max_polls)
     output_dir = repo.hunt / "FINDINGS" / "drafts" / draft["id"]
     save_evidence(
         repo,
@@ -983,6 +1000,7 @@ def run_callback(repo, scope, draft):
         {"baseline_hits": base_count, "hit": (hit or [])[:1]},
     )
     steps = {"status": status, "baseline_hits": base_count, "interaction": hit is not None, "hit": (hit or [])[:1]}
+    audit(repo, "hx verify", "callback", poll_url, "ok", f"baseline={base_count} interaction={hit is not None}")
     return hit is not None, steps
 
 
@@ -1075,6 +1093,8 @@ def cmd_verify(args):
     draft["fail_detail"] = steps
     if scenario == "echo":
         draft["fail_reason"] = "reflection_absent_or_escaped"
+    draft.pop("proof", None)
+    draft.pop("pass_requires_attest", None)
     dump_json(draft_path, draft)
     print(f"{draft['id']}: FAIL — {json.dumps(steps, ensure_ascii=False)}")
     return EXIT_OK
