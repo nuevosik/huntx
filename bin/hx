@@ -214,6 +214,8 @@ def cmd_release(args):
                 continue
             if hyp["owner"] not in (session_tag(), None) and not args.force:
                 raise HxError("nao e o dono (use --force)", EXIT_GUARD)
+            if hyp["status"] == "result":
+                raise HxError("hipotese ja fechada (result) — release nao reabre terminal", EXIT_GUARD)
             hyp["status"] = "open"
             hyp["owner"] = None
             hyp["claimed_ts"] = None
@@ -235,7 +237,10 @@ def update_coverage(repo, endpoint, cls, status, evidence, note):
     row = f"| {endpoint} | {cls} | {status} | {evidence} | {note} |"
     replaced = False
     for i, line in enumerate(lines):
-        if line.startswith("|") and endpoint in line and f"| {cls} " in line:
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) >= 2 and cells[0] == endpoint and cells[1] == cls:
             lines[i] = row
             replaced = True
             break
