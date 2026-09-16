@@ -61,15 +61,24 @@ def dump_json(path, data):
     atomic_write(Path(path), json.dumps(data, indent=1, ensure_ascii=False))
 
 
+_LOCKS_HELD = set()
+
+
 @contextmanager
 def flock(lock_path):
     lock_path = Path(lock_path)
+    key = str(lock_path.resolve())
+    if key in _LOCKS_HELD:
+        yield
+        return
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(lock_path, "a+")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX)
+        _LOCKS_HELD.add(key)
         yield
     finally:
+        _LOCKS_HELD.discard(key)
         fcntl.flock(handle, fcntl.LOCK_UN)
         handle.close()
 
@@ -296,7 +305,9 @@ AUTH_FAIL_STATUSES = {401, 403}
 
 
 def evidence_auth_failure(repo, hyp):
-    evidence_dir = Path(hyp.get("evidence") or "")
+    if not hyp.get("evidence"):
+        return False
+    evidence_dir = Path(hyp["evidence"])
     if not evidence_dir.is_absolute():
         evidence_dir = repo.eng / evidence_dir
     if not evidence_dir.exists():
@@ -304,8 +315,8 @@ def evidence_auth_failure(repo, hyp):
     files = sorted(evidence_dir.glob("*.json"), key=lambda path: path.stat().st_mtime)
     if not files:
         return False
-    record = load_json(files[-1], {})
-    return int((record.get("response") or {}).get("status", 0)) in AUTH_FAIL_STATUSES
+    status = (load_json(files[-1], {}).get("response") or {}).get("status")
+    return isinstance(status, int) and status in AUTH_FAIL_STATUSES
 
 
 def refute_gate(repo, hyp):
