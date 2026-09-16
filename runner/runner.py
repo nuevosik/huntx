@@ -166,6 +166,21 @@ def record_run(repo, record):
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def adjudicate(repo, hid):
+    draft_path = repo.hunt / "FINDINGS" / "drafts" / f"{hid}.json"
+    if not draft_path.exists():
+        return {"ran": False}
+    hx_bin = REPO_ROOT / "bin" / "hx"
+    try:
+        proc = subprocess.run([str(hx_bin), "verify", hid], cwd=str(repo.eng), capture_output=True, text=True, timeout=600)
+    except Exception as exc:
+        return {"ran": True, "rc": None, "error": str(exc)[:200]}
+    result = {"ran": True, "rc": proc.returncode, "promoted": proc.returncode == 0 and not draft_path.exists()}
+    if proc.returncode == 7:
+        result["pending_attest"] = True
+    return result
+
+
 def run_slice(ctx):
     repo = ctx["repo"]
     hyp = ctx["hyp"]
@@ -182,6 +197,8 @@ def run_slice(ctx):
         "cost": usage.get("cost"),
         "stderr": (stderr or "")[:400],
     }
+    if not ctx.get("no_adjudicate"):
+        record["adjudication"] = adjudicate(repo, hyp["id"])
     record_run(repo, record)
     return record
 
@@ -251,6 +268,7 @@ def runner_main(argv=None):
     ctx = {
         "repo": repo, "hyp": None, "brief": "", "config": os.environ.get("RUNNER_CONFIG_CONTENT") or json.dumps({"default_agent": "hunt-auto"}),
         "model": args.model, "budget": budget, "started_ts": hx.now(), "slices_done": 0, "tokens_used": 0, "cost_used": 0,
+        "no_adjudicate": args.no_adjudicate,
     }
     write_pid(repo)
     install_signals(ctx)
