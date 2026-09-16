@@ -136,7 +136,8 @@ def retry_invoke(ctx, prompt):
         else:
             wait = min(budget["backoff_max_s"], budget["backoff_base_s"] * (2 ** (attempts - 1)))
         session = session or parse_session_id(stdout)
-        hx.sleep(wait)
+        if attempts < budget["backoff_attempts"]:
+            hx.sleep(wait)
     return rc, stdout, stderr, attempts
 
 
@@ -255,6 +256,28 @@ def check_stop(ctx):
     return None
 
 
+def build_config_content(agent_md_path):
+    text = Path(agent_md_path).read_text()
+    if text.startswith("---"):
+        parts = text.split("---", 2)
+        body = parts[2].strip() if len(parts) >= 3 else text
+    else:
+        body = text.strip()
+    config = {
+        "$schema": "https://opencode.ai/config.json",
+        "agent": {
+            "hunt-auto": {
+                "description": "headless hunt worker (runner)",
+                "mode": "primary",
+                "permission": {"bash": {"*": "deny", "hx *": "allow"}, "edit": "allow"},
+                "prompt": body,
+            }
+        },
+        "default_agent": "hunt-auto",
+    }
+    return json.dumps(config)
+
+
 def runner_main(argv=None):
     parser = argparse.ArgumentParser(prog="runner")
     parser.add_argument("--engagement", default=".")
@@ -267,33 +290,36 @@ def runner_main(argv=None):
     os.environ["HX_ENGAGEMENT"] = str(repo.eng)
     owner = f"runner-{os.getpid()}"
     budget = {**DEFAULTS, "slices_max": args.slices, "wall_s": args.wall, "token_cap": None, "cost_cap": None}
+    config = os.environ.get("RUNNER_CONFIG_CONTENT") or build_config_content(REPO_ROOT / "opencode" / "agents" / "hunt-auto.md")
     ctx = {
-        "repo": repo, "hyp": None, "brief": "", "config": os.environ.get("RUNNER_CONFIG_CONTENT") or json.dumps({"default_agent": "hunt-auto"}),
+        "repo": repo, "hyp": None, "brief": "", "config": config,
         "model": args.model, "budget": budget, "started_ts": hx.now(), "slices_done": 0, "tokens_used": 0, "cost_used": 0,
         "no_adjudicate": args.no_adjudicate,
     }
     write_pid(repo)
     install_signals(ctx)
-    while True:
-        reason = check_stop(ctx)
-        if reason:
-            print(f"runner: parada ({reason})")
-            break
-        hyp = claim_next(repo, owner)
-        if hyp is None:
-            print("runner: fila vazia")
-            break
-        alive, tag = health_gate(hx, repo, hyp)
-        if not alive:
-            hx.main(["result", hyp["id"], "--verdict", "blocked", "--note", f"sessao {tag} morta", "--force"])
+    try:
+        while True:
+            reason = check_stop(ctx)
+            if reason:
+                print(f"runner: parada ({reason})")
+                break
+            hyp = claim_next(repo, owner)
+            if hyp is None:
+                print("runner: fila vazia")
+                break
+            alive, tag = health_gate(hx, repo, hyp)
+            if not alive:
+                hx.main(["result", hyp["id"], "--verdict", "blocked", "--note", f"sessao {tag} morta", "--force"])
+                ctx["slices_done"] += 1
+                continue
+            ctx["hyp"] = hyp
+            record = run_slice(ctx)
             ctx["slices_done"] += 1
-            continue
-        ctx["hyp"] = hyp
-        record = run_slice(ctx)
-        ctx["slices_done"] += 1
-        ctx["tokens_used"] += record.get("tokens") or 0
-        ctx["cost_used"] += record.get("cost") or 0
-    (repo.hunt / "runner.pid").unlink(missing_ok=True)
+            ctx["tokens_used"] += record.get("tokens") or 0
+            ctx["cost_used"] += record.get("cost") or 0
+    finally:
+        (repo.hunt / "runner.pid").unlink(missing_ok=True)
     return 0
 
 
