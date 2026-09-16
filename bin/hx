@@ -811,6 +811,20 @@ def execute_request(repo, scope, method, url, session_path, body, marker, save_d
     return status, resp_headers, text, path
 
 
+def guarded_fetch(repo, scope, method, url, session_file=None, headers=None):
+    allowed, reason = check_scope(scope, url)
+    if not allowed:
+        raise HxError(f"guard: {reason}", EXIT_GUARD)
+    if classify_method(scope, method, url) == "staged":
+        raise HxError(f"metodo estagiado: {method} {url}", EXIT_STAGED)
+    cookies = load_session(repo.eng / session_file) if session_file else []
+    host = urlparse(url).hostname or ""
+    rate_acquire(scope, repo, host, float(scope["rate"].get("max_wait_s", 30)))
+    status, resp_headers, body = fetch(method, url, headers, None, cookies)
+    apply_health_signals(repo, scope, host, status, resp_headers, body)
+    return status, resp_headers, body
+
+
 def cmd_run(args):
     repo = repo_from_cwd()
     scope = repo.scope()
@@ -846,17 +860,7 @@ def run_differential(repo, scope, draft):
     pattern = (draft.get("marker") or {}).get("extract")
 
     def call(session_file, url):
-        allowed, reason = check_scope(scope, url)
-        if not allowed:
-            raise HxError(f"guard: {reason}", EXIT_GUARD)
-        if classify_method(scope, request["method"], url) == "staged":
-            raise HxError(f"verify nao executa metodo estagiado: {request['method']} {url}", EXIT_STAGED)
-        cookies = load_session(repo.eng / session_file)
-        host = urlparse(url).hostname or ""
-        rate_acquire(scope, repo, host, float(scope["rate"].get("max_wait_s", 30)))
-        status, headers, body = fetch(request["method"], url, None, None, cookies)
-        apply_health_signals(repo, scope, host, status, headers, body)
-        return status, headers, body
+        return guarded_fetch(repo, scope, request["method"], url, session_file)
 
     def substitute(url, mapping):
         for key, value in mapping.items():
