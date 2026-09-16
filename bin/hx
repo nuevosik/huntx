@@ -860,7 +860,32 @@ def run_differential(repo, scope, draft):
 
 
 def run_attest(repo, draft, draft_path):
-    raise HxError("attest chega na Task 11", EXIT_GUARD)
+    if not stdin_is_tty():
+        raise HxError("attest exige TTY interativo", EXIT_TTY)
+    proof = draft.get("proof")
+    if proof:
+        victim = proof.get("victim", {})
+        attacker = proof.get("attacker", {})
+        control = proof.get("control", {})
+        print("prova mecanica do draft:")
+        print(f"  marcador: {victim.get('marker')}")
+        print(f"  vitima: {victim.get('status')} | atacante: {attacker.get('status')} (marker presente: {attacker.get('marker_present')}) | controle: {control.get('status')} (marker ausente: {control.get('marker_absent')})")
+    else:
+        print("sem prova mecanica — checklist manual:")
+    print("checklist: (1) contexto escalado p/ 2 contas proprias? (2) segundo teste independente? (3) payload reproduzivel?")
+    typed = read_line(f"digite o id do draft para assinar ({draft['id']}): ")
+    if typed.strip() != draft["id"]:
+        raise HxError("assinatura nao confere; abortado", EXIT_GUARD)
+    try:
+        tty = os.ttyname(sys.stdin.fileno())
+    except OSError:
+        tty = None
+    draft["verified_at"] = now()
+    draft["verdict"] = "verified-manual"
+    draft["attest"] = {"draft_id": draft["id"], "uid": os.getuid(), "tty": tty, "ts": now()}
+    dump_json(repo.hunt / "FINDINGS" / f"{draft['id']}.json", draft)
+    draft_path.unlink()
+    print(f"{draft['id']}: verified-manual (uid {os.getuid()})")
 
 
 def cmd_verify(args):
