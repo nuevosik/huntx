@@ -223,6 +223,116 @@ def cmd_release(args):
     raise HxError(f"hipotese nao encontrada: {args.id}", EXIT_GUARD)
 
 
+VERDICT_TO_COVERAGE = {"confirmed": "confirmed", "refuted": "refuted", "blocked": "blocked", "unverified": "untested"}
+
+
+def update_coverage(repo, endpoint, cls, status, evidence, note):
+    path = repo.coverage
+    path.touch(exist_ok=True)
+    lines = path.read_text().splitlines()
+    header = "| endpoint | classe | status | evidência | nota |"
+    sep = "|---|---|---|---|---|"
+    row = f"| {endpoint} | {cls} | {status} | {evidence} | {note} |"
+    replaced = False
+    for i, line in enumerate(lines):
+        if line.startswith("|") and endpoint in line and f"| {cls} " in line:
+            lines[i] = row
+            replaced = True
+            break
+    if not replaced:
+        if not lines:
+            lines = [header, sep]
+        elif header not in lines:
+            lines += ["", header, sep]
+        lines.append(row)
+    atomic_write(path, "\n".join(lines) + "\n")
+
+
+def finding_verified(repo, hypothesis_id):
+    finding_path = repo.hunt / "FINDINGS" / f"{hypothesis_id}.json"
+    if not finding_path.exists():
+        return False, "sem FINDINGS/<id>.json"
+    data = load_json(finding_path, {})
+    if data.get("verdict") == "verified-manual":
+        return True, "manual-attested"
+    if data.get("verified_at") and data.get("proof"):
+        return True, "cenario PASS"
+    return False, "finding sem verificacao"
+
+
+def cmd_result(args):
+    repo = repo_from_cwd()
+    with flock(repo.hunt / ".lock.hyps"):
+        hyps, _ = load_hyps(repo)
+        hyp = next((h for h in hyps if h["id"] == args.id), None)
+        if not hyp:
+            raise HxError(f"hipotese nao encontrada: {args.id}", EXIT_GUARD)
+        if hyp["owner"] not in (session_tag(), None) and not args.force:
+            raise HxError("nao e o dono (use --force)", EXIT_GUARD)
+        if args.verdict == "confirmed":
+            verified, reason = finding_verified(repo, hyp["id"])
+            if not verified:
+                raise HxError(f"confirmed exige finding verificado ({reason}) — rode hx verify primeiro", EXIT_GUARD)
+        session_check = None
+        if args.verdict == "refuted":
+            session_check = refute_gate(repo, hyp)
+        hyp["status"] = "result"
+        hyp["closed_ts"] = now()
+        hyp["result"] = {"verdict": args.verdict, "note": args.note, "evidence": args.evidence, "session_check": session_check}
+        save_hyps(repo, hyps)
+    update_coverage(repo, hyp["endpoint"], hyp["class"], VERDICT_TO_COVERAGE[args.verdict], args.evidence or hyp["evidence"], args.note or "")
+    print(f"{hyp['id']} -> {args.verdict}")
+
+
+def refute_gate(repo, hyp):
+    return None
+
+
+def cmd_brief(args):
+    repo = repo_from_cwd()
+    scope = repo.scope()
+    hyps, _ = load_hyps(repo)
+    health = load_json(repo.health, {})
+    parts = ["== HUNT BRIEF =="]
+    target_path = repo.hunt / "TARGET.md"
+    if target_path.exists():
+        tlines = [line.strip() for line in target_path.read_text().splitlines() if line.strip()][:4]
+        if tlines:
+            parts.append("alvo: " + " | ".join(tlines))
+    in_scope = len(scope.get("in_scope", []))
+    banned_hosts = len(scope.get("out_of_scope_hosts", []))
+    banned_paths = ", ".join(scope.get("out_of_scope_paths", [])) or "-"
+    parts.append(f"escopo: {in_scope} hosts in | {banned_hosts} banidos | paths banidos: {banned_paths}")
+    dead = [tag for tag, entry in health.items() if entry.get("dead_since")]
+    if dead:
+        parts.append("sessoes mortas: " + ", ".join(dead))
+    counts = {}
+    if repo.coverage.exists():
+        for line in repo.coverage.read_text().splitlines():
+            if line.startswith("|") and "---" not in line and "endpoint" not in line:
+                cells = [cell.strip() for cell in line.strip("|").split("|")]
+                if len(cells) >= 3:
+                    counts[cells[2]] = counts.get(cells[2], 0) + 1
+    if counts:
+        parts.append("coverage: " + " ".join(f"{k}:{v}" for k, v in sorted(counts.items())))
+    open_hyps = [h for h in hyps if h["status"] == "open"]
+    if open_hyps:
+        parts.append("hipoteses abertas:")
+        for hyp in open_hyps[:5]:
+            parts.append(f"  [{hyp['id']}] {hyp['claim'][:80]}")
+    sessions_dir = repo.hunt / "sessions"
+    sessions = sorted(sessions_dir.glob("*.md")) if sessions_dir.exists() else []
+    if sessions:
+        tail = sessions[-1].read_text().splitlines()[-8:]
+        parts.append("ultimo debrief:")
+        parts.extend("  " + line for line in tail)
+    text = "\n".join(parts)
+    limit = args.max_bytes
+    if len(text.encode("utf-8")) > limit:
+        text = text.encode("utf-8")[:limit].decode("utf-8", errors="ignore") + "\n...[truncado]"
+    print(text)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="hx")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -244,6 +354,14 @@ def main(argv=None):
     rel_p = sub.add_parser("release")
     rel_p.add_argument("id")
     rel_p.add_argument("--force", action="store_true")
+    res_p = sub.add_parser("result")
+    res_p.add_argument("id")
+    res_p.add_argument("--verdict", required=True, choices=["confirmed", "refuted", "blocked", "unverified"])
+    res_p.add_argument("--note", required=True)
+    res_p.add_argument("--evidence")
+    res_p.add_argument("--force", action="store_true")
+    brief_p = sub.add_parser("brief")
+    brief_p.add_argument("--max-bytes", dest="max_bytes", type=int, default=4000)
     args = parser.parse_args(argv)
     try:
         if args.cmd == "init":
@@ -254,6 +372,10 @@ def main(argv=None):
             cmd_next(args)
         elif args.cmd == "release":
             cmd_release(args)
+        elif args.cmd == "result":
+            cmd_result(args)
+        elif args.cmd == "brief":
+            cmd_brief(args)
         return EXIT_OK
     except HxError as err:
         print(f"hx: {err}", file=sys.stderr)
