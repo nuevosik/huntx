@@ -37,6 +37,6 @@
 
 - Comando: `python3 runner/runner.py --engagement . --slices N --wall SEGUNDOS` (a partir do checkout do huntx) — 1 worker sequencial; spawna `opencode run` headless com o agente `hunt-auto` injetado inline e adjudica o draft (se houver) com `hx verify`.
 - Cada fatia vira um record em `hunt/runs.jsonl`.
-- Paradas: fila vazia, `--slices`/`--wall` esgotados ou `runner.stop` presente.
+- Paradas: fila vazia, `--slices`/`--wall`/caps (`--max-tokens`, `--max-cost`) esgotados ou `runner.stop` presente.
 - Sessão morta (só com probes no scope e `session_tag` na hipótese): a hipótese fecha `blocked` e o runner segue.
-- Kill: `touch hunt/runner.stop` (honrado entre fatias; a fatia em voo roda até o timeout); SIGINT/SIGTERM no processo pedem a mesma parada.
+- Kill: `touch hunt/runner.stop` (honrado entre fatias e entre retries; a tentativa em voo roda até o timeout); SIGINT/SIGTERM no processo pedem a mesma parada. Retome com `rm hunt/runner.stop` — o start do próximo runner também limpa o latch.
