@@ -5,7 +5,6 @@ mkdir -p "$HOME/.config/opencode/agents" "$HOME/.config/opencode/commands" "$HOM
 chmod +x "$ROOT/bin/hx"
 ln -sf "$ROOT/bin/hx" "$HOME/.local/bin/hx"
 ln -sf "$ROOT/opencode/agents/hunt.md" "$HOME/.config/opencode/agents/hunt.md"
-ln -sf "$ROOT/opencode/agents/hunt-auto.md" "$HOME/.config/opencode/agents/hunt-auto.md"
 ln -sf "$ROOT/opencode/commands/brief.md" "$HOME/.config/opencode/commands/brief.md"
 ln -sf "$ROOT/opencode/commands/next.md" "$HOME/.config/opencode/commands/next.md"
 ln -sf "$ROOT/opencode/commands/debrief.md" "$HOME/.config/opencode/commands/debrief.md"
