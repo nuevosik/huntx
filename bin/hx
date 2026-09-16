@@ -717,7 +717,7 @@ def probe_once(repo, scope, tag):
     host = urlparse(probe["url"]).hostname or ""
     max_wait = float(scope["rate"].get("max_wait_s", 30))
     rate_acquire(scope, repo, host, max_wait)
-    status, headers, body = fetch(probe["method"], probe["url"], None, None, cookies)
+    status, headers, body = fetch(probe["method"], probe["url"], probe.get("headers"), None, cookies)
     for sig in scope["health"]["rate_limited_if"]:
         if signal_matches(sig, status, headers, body):
             return False, "ratelimit"
