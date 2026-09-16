@@ -137,7 +137,7 @@ def cmd_init(args):
     protocol = templates / "HUNT.md"
     if protocol.exists():
         atomic_write(eng / "HUNT.md", protocol.read_text())
-    atomic_write(hunt / ".gitignore", "scans/\nsessions/\n.health.json\n.ratelimit.json\npending/\naudit.log\n")
+    atomic_write(hunt / ".gitignore", "scans/\nsessions/\n.health.json\n.ratelimit.json\npending/\naudit.log\nrunner.pid\nrunner.stop\nruns.jsonl\n")
     print(f"engagement inicializado: {hunt}")
 
 

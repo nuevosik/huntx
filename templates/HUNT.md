@@ -32,3 +32,10 @@
 - Escreve `hunt/sessions/AAAA-MM-DD-NN.md`: o que rodou, vereditos, hipóteses novas, deltas de coverage, dúvidas abertas.
 - Atualiza `TARGET.md` se aprendeu algo do alvo.
 - Só achado verificado vira `FINDINGS/`.
+
+## Runner (opt-in)
+
+- Comando: `python3 runner/runner.py --engagement . --slices N --wall SEGUNDOS` (a partir do checkout do huntx) — 1 worker sequencial; spawna `opencode run` headless com o agente `hunt-auto` injetado inline e adjudica drafts com `hx verify`.
+- Cada fatia vira um record em `hunt/runs.jsonl`.
+- Paradas: fila vazia, `--slices`/`--wall` esgotados, sessão morta (hipótese fecha `blocked`) ou `runner.stop` presente.
+- Kill: `touch hunt/runner.stop`; SIGINT/SIGTERM no processo pedem a mesma parada.

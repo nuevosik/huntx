@@ -34,10 +34,19 @@ hx brief
 hx next
 ```
 
+## Runner (opt-in)
+
+```bash
+python3 runner/runner.py --engagement ~/hunts/target --slices 5 --wall 3600
+```
+
+One worker, one slice at a time: claims from the queue, spawns `opencode run` with a `hunt-auto` agent injected inline via `OPENCODE_CONFIG_CONTENT` (no symlink, nothing written to your opencode config), appends each slice to `hunt/runs.jsonl`, then adjudicates the draft with `hx verify`. Budgets: `--slices` and `--wall`; the loop also stops on an empty queue. Stop or kill at any time with `touch hunt/runner.stop` (SIGINT/SIGTERM do the same).
+
 ## Tests
 
 ```bash
 python3 tests/test_hx.py                 # 90 tests, stdlib
+python3 tests/test_runner.py             # 25 tests, stdlib
 node --test tests/plugin_guard.test.mjs  # 10 tripwire tests
 ```
 
