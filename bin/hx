@@ -10,6 +10,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
+from uuid import uuid4
 
 EXIT_OK = 0
 EXIT_GUARD = 2
@@ -378,6 +379,8 @@ def classify_method(scope, method, url):
     for entry in scope.get("allowed_mutations", []):
         entry_method, _, entry_path = entry.partition(" ")
         prefix = entry_path.rstrip("/")
+        if not prefix:
+            continue
         if entry_method.upper() == method.upper() and (path == prefix or path.startswith(prefix + "/")):
             return "auto"
     return "staged"
@@ -385,7 +388,7 @@ def classify_method(scope, method, url):
 
 def stage_pending(repo, spec):
     (repo.hunt / "pending").mkdir(parents=True, exist_ok=True)
-    pending_id = str(int(now()))
+    pending_id = f"{int(now())}-{uuid4().hex[:6]}"
     record = {"id": pending_id, "staged_ts": now(), **spec}
     dump_json(repo.hunt / "pending" / f"{pending_id}.json", record)
     return pending_id
