@@ -710,6 +710,7 @@ def runner_main(argv=None):
     parser.add_argument("--plan", action="store_true")
     parser.add_argument("--plan-n", dest="plan_n", type=int, default=5)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--netns", action="store_true")
     parser.add_argument("--max-tokens", dest="max_tokens", type=int, default=None)
     parser.add_argument("--max-cost", dest="max_cost", type=float, default=None)
     args = parser.parse_args(argv)
@@ -733,6 +734,17 @@ def runner_main(argv=None):
     if args.plan and args.workers > 1:
         print("runner: --plan nao combina com --workers > 1")
         return 2
+    raw_argv = list(argv if argv is not None else sys.argv[1:])
+    if args.netns and os.environ.get("HX_NETNS") != "1":
+        env = dict(os.environ, HX_NETNS="1")
+        os.execvpe("unshare", ["unshare", "-Ur", "--", sys.executable, str(Path(__file__).resolve()), *raw_argv], env)
+    if args.netns:
+        problems = netns_preflight()
+        if problems:
+            print("runner: --netns indisponivel:")
+            for problem in problems:
+                print(f"  - {problem}")
+            return 2
     problems = workers_gate(repo, args.workers)
     if problems:
         print("runner: gate de workers recusou:")
@@ -750,6 +762,7 @@ def runner_main(argv=None):
         "repo": repo, "hyp": None, "brief": "", "config": config, "owner": owner,
         "model": args.model, "budget": budget, "started_ts": hx.now(),
         "no_adjudicate": args.no_adjudicate, "plan_n": args.plan_n,
+        "netns": args.netns,
     }
     try:
         write_pid(repo)
@@ -758,14 +771,14 @@ def runner_main(argv=None):
             run_plan(ctx)
             return 0
         runner_state_init(repo)
-        if args.workers <= 1:
-            print(f"runner: parada ({worker_loop(ctx)})")
-        else:
-            reasons = run_workers(ctx, args.workers)
+        if args.netns or args.workers > 1:
+            reasons = run_workers(ctx, max(args.workers, 1))
             for reason in reasons:
                 print(f"runner: worker parada ({reason})")
             if "crashed" in reasons:
                 return 1
+        else:
+            print(f"runner: parada ({worker_loop(ctx)})")
     finally:
         (repo.hunt / "runner.pid").unlink(missing_ok=True)
     return 0
