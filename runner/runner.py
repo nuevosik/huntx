@@ -477,6 +477,10 @@ def workers_gate(repo, workers):
     return problems
 
 
+def claim_ttl_for(budget):
+    return max(hx.TTL_CLAIM_S, budget["backoff_attempts"] * budget["slice_timeout_s"] + 300)
+
+
 def release_claim(repo, hyp_id):
     with hx.flock(repo.hunt / ".lock.hyps"):
         hyps, _ = hx.load_hyps(repo)
@@ -587,6 +591,7 @@ def runner_main(argv=None):
     owner = f"runner-{os.getpid()}"
     os.environ["HX_SESSION"] = owner
     budget = {**DEFAULTS, "slices_max": args.slices, "wall_s": args.wall, "token_cap": args.max_tokens, "cost_cap": args.max_cost}
+    hx.TTL_CLAIM_S = claim_ttl_for(budget)
     config = os.environ.get("RUNNER_CONFIG_CONTENT") or build_config_content(REPO_ROOT / "opencode" / "agents" / "hunt-auto.md", plan=args.plan)
     ctx = {
         "repo": repo, "hyp": None, "brief": "", "config": config, "owner": owner,
@@ -603,8 +608,11 @@ def runner_main(argv=None):
         if args.workers <= 1:
             print(f"runner: parada ({worker_loop(ctx)})")
         else:
-            for reason in run_workers(ctx, args.workers):
+            reasons = run_workers(ctx, args.workers)
+            for reason in reasons:
                 print(f"runner: worker parada ({reason})")
+            if "crashed" in reasons:
+                return 1
     finally:
         (repo.hunt / "runner.pid").unlink(missing_ok=True)
     return 0
