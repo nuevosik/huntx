@@ -706,7 +706,7 @@ def start_netns_backend(pid, backend):
     read_fd, write_fd = os.pipe()
     try:
         proc = subprocess.Popen(
-            ["slirp4netns", "--configure", "--mtu=65520", "--disable-host-loopback", f"--ready-fd={write_fd}", str(pid)],
+            ["slirp4netns", "--configure", "--mtu=65520", "--disable-host-loopback", f"--ready-fd={write_fd}", str(pid), "tap0"],
             pass_fds=(write_fd,),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -785,6 +785,61 @@ def run_workers(ctx, workers):
     return reasons
 
 
+def netns_selfcheck():
+    proc_ctx = multiprocessing.get_context("fork")
+    parent_ctrl, child_ctrl = proc_ctx.Pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.unshare(os.CLONE_NEWNET)
+            child_ctrl.send("netns")
+            if child_ctrl.recv() != "go":
+                os._exit(3)
+            try:
+                Path("/proc/sys/net/ipv6/conf/all/disable_ipv6").write_text("1")
+            except OSError:
+                pass
+            ips = resolve_ips({"localhost"})
+            ips.add("127.0.0.1")
+            apply_netns_rules(ips, netns_resolvers())
+            checks = {}
+            route = Path("/proc/net/route").read_text() if Path("/proc/net/route").exists() else ""
+            checks["default_route"] = any(line.split()[1] == "00000000" for line in route.splitlines()[1:])
+            try:
+                with socket.create_connection(("192.0.2.1", 443), timeout=3):
+                    checks["out_of_scope_blocked"] = False
+            except OSError:
+                checks["out_of_scope_blocked"] = True
+            result = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True)
+            checks["rules_present"] = "policy drop" in (result.stdout or "")
+            tamper = subprocess.run(["setpriv", "--bounding-set=-net_admin", "--", "nft", "add", "table", "inet", "tamper"], capture_output=True, text=True)
+            checks["agent_cannot_tamper"] = tamper.returncode != 0
+            print(json.dumps(checks), flush=True)
+            os._exit(0 if all(checks.values()) else 1)
+        except Exception as err:
+            print(json.dumps({"error": str(err)[:200]}), flush=True)
+            os._exit(2)
+    if not parent_ctrl.poll(30):
+        os.kill(pid, signal.SIGKILL)
+        print(json.dumps({"error": "child nao criou o netns"}))
+        return 2
+    parent_ctrl.recv()
+    backend = start_netns_backend(pid, "slirp4netns")
+    parent_ctrl.send("go")
+    try:
+        _, status = os.waitpid(pid, 0)
+    finally:
+        backend.terminate()
+        try:
+            backend.wait(timeout=5)
+        except Exception:
+            pass
+    code = os.waitstatus_to_exitcode(status)
+    if code == 0:
+        print("SELFCHECK OK")
+    return code
+
+
 def runner_main(argv=None):
     parser = argparse.ArgumentParser(prog="runner")
     parser.add_argument("--engagement", default=".")
@@ -796,9 +851,12 @@ def runner_main(argv=None):
     parser.add_argument("--plan-n", dest="plan_n", type=int, default=5)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--netns", action="store_true")
+    parser.add_argument("--netns-selfcheck", dest="netns_selfcheck", action="store_true")
     parser.add_argument("--max-tokens", dest="max_tokens", type=int, default=None)
     parser.add_argument("--max-cost", dest="max_cost", type=float, default=None)
     args = parser.parse_args(argv)
+    if args.netns_selfcheck:
+        return netns_selfcheck()
     repo = hx.Repo(Path(args.engagement).resolve())
     pid_file = repo.hunt / "runner.pid"
     if pid_file.exists():
