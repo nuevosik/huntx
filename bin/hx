@@ -137,7 +137,7 @@ def cmd_init(args):
     protocol = templates / "HUNT.md"
     if protocol.exists():
         atomic_write(eng / "HUNT.md", protocol.read_text())
-    atomic_write(hunt / ".gitignore", "scans/\nsessions/\n.health.json\n.ratelimit.json\npending/\naudit.log\nrunner.pid\nrunner.stop\nruns.jsonl\n.lock.*\n")
+    atomic_write(hunt / ".gitignore", "scans/\nsessions/\n.health.json\n.ratelimit.json\n.runnerstate.json\npending/\naudit.log\nrunner.pid\nrunner.stop\nruns.jsonl\n.lock.*\n")
     print(f"engagement inicializado: {hunt}")
 
 
@@ -268,28 +268,29 @@ VERDICT_TO_COVERAGE = {"confirmed": "confirmed", "refuted": "refuted", "blocked"
 
 
 def update_coverage(repo, endpoint, cls, status, evidence, note):
-    path = repo.coverage
-    path.touch(exist_ok=True)
-    lines = path.read_text().splitlines()
-    header = "| endpoint | classe | status | evidência | nota |"
-    sep = "|---|---|---|---|---|"
-    row = f"| {endpoint} | {cls} | {status} | {evidence} | {note} |"
-    replaced = False
-    for i, line in enumerate(lines):
-        if not line.startswith("|"):
-            continue
-        cells = [cell.strip() for cell in line.strip("|").split("|")]
-        if len(cells) >= 2 and cells[0] == endpoint and cells[1] == cls:
-            lines[i] = row
-            replaced = True
-            break
-    if not replaced:
-        if not lines:
-            lines = [header, sep]
-        elif header not in lines:
-            lines += ["", header, sep]
-        lines.append(row)
-    atomic_write(path, "\n".join(lines) + "\n")
+    with flock(repo.hunt / ".lock.coverage"):
+        path = repo.coverage
+        path.touch(exist_ok=True)
+        lines = path.read_text().splitlines()
+        header = "| endpoint | classe | status | evidência | nota |"
+        sep = "|---|---|---|---|---|"
+        row = f"| {endpoint} | {cls} | {status} | {evidence} | {note} |"
+        replaced = False
+        for i, line in enumerate(lines):
+            if not line.startswith("|"):
+                continue
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if len(cells) >= 2 and cells[0] == endpoint and cells[1] == cls:
+                lines[i] = row
+                replaced = True
+                break
+        if not replaced:
+            if not lines:
+                lines = [header, sep]
+            elif header not in lines:
+                lines += ["", header, sep]
+            lines.append(row)
+        atomic_write(path, "\n".join(lines) + "\n")
 
 
 def finding_verified(repo, hypothesis_id):
