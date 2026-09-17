@@ -350,7 +350,7 @@ def invoke_opencode(prompt, cwd, config_content, timeout_s, model=None, resume_s
     env["OPENCODE_CONFIG_CONTENT"] = config_content
     if env_extra:
         env.update(env_extra)
-    argv = ["opencode", "run", "--format", "json"]
+    argv = agent_argv(["opencode", "run", "--format", "json"])
     if model:
         argv += ["--model", model]
     if resume_session:
@@ -647,12 +647,32 @@ def release_claim(repo, hyp_id):
     return False
 
 
+def netns_worker_enter(ctx):
+    os.unshare(os.CLONE_NEWNET)
+    ctx["netns_ctrl"].send("netns")
+    if ctx["netns_ctrl"].recv() != "go":
+        raise hx.HxError("netns: supervisor nao confirmou a criacao do namespace", hx.EXIT_GUARD)
+    try:
+        Path("/proc/sys/net/ipv6/conf/all/disable_ipv6").write_text("1")
+    except OSError:
+        pass
+    ips = resolve_ips(netns_allow_hosts(ctx["repo"]))
+    apply_netns_rules(ips, netns_resolvers())
+
+
+def netns_refresh(ctx, hyp):
+    ips = resolve_ips(netns_allow_hosts(ctx["repo"], hyp))
+    apply_netns_rules(ips, netns_resolvers())
+
+
 def worker_loop(ctx):
     repo = ctx["repo"]
     budget = ctx["budget"]
     worker = ctx.get("worker")
     owner = ctx.get("owner") or f"runner-{os.getpid()}"
     os.environ["HX_SESSION"] = owner
+    if ctx.get("netns"):
+        netns_worker_enter(ctx)
     while True:
         reason = check_stop(ctx)
         if reason:
@@ -660,6 +680,8 @@ def worker_loop(ctx):
         hyp = claim_next(repo, owner, worker)
         if hyp is None:
             return "empty_queue"
+        if ctx.get("netns"):
+            netns_refresh(ctx, hyp)
         if not runner_state_reserve_slice(repo, budget["slices_max"]):
             release_claim(repo, hyp["id"])
             return "slices"
@@ -676,21 +698,62 @@ def worker_entry(queue, ctx):
     queue.put(worker_loop(ctx))
 
 
+def start_netns_backend(pid, backend):
+    if backend != "slirp4netns":
+        raise hx.HxError(f"netns: backend nao suportado: {backend}", hx.EXIT_GUARD)
+    read_fd, write_fd = os.pipe()
+    proc = subprocess.Popen(
+        ["slirp4netns", "--configure", "--mtu=65520", "--disable-host-loopback", f"--ready-fd={write_fd}", str(pid)],
+        pass_fds=(write_fd,),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    os.close(write_fd)
+    ready = os.read(read_fd, 1)
+    os.close(read_fd)
+    if not ready:
+        proc.terminate()
+        raise hx.HxError("netns: slirp4netns nao ficou pronto", hx.EXIT_GUARD)
+    return proc
+
+
 def run_workers(ctx, workers):
     repo = ctx["repo"]
     probes = (repo.scope().get("health") or {}).get("probes") or []
     proc_ctx = multiprocessing.get_context("fork")
     queue = proc_ctx.Queue()
+    netns = bool(ctx.get("netns"))
     procs = []
+    backends = []
     for i in range(workers):
         wctx = dict(ctx)
-        wctx["worker"] = probes[i]["session"]
-        wctx["owner"] = probes[i]["session"]
+        session = probes[i]["session"] if i < len(probes) else None
+        wctx["worker"] = session
+        wctx["owner"] = session or f"runner-{os.getpid()}"
+        parent_ctrl = None
+        if netns:
+            parent_ctrl, child_ctrl = proc_ctx.Pipe()
+            wctx["netns_ctrl"] = child_ctrl
         proc = proc_ctx.Process(target=worker_entry, args=(queue, wctx))
         proc.start()
+        if netns:
+            if not parent_ctrl.poll(30):
+                raise hx.HxError("netns: worker nao criou o namespace", hx.EXIT_GUARD)
+            parent_ctrl.recv()
+            backends.append(start_netns_backend(proc.pid, ctx.get("backend") or "slirp4netns"))
+            parent_ctrl.send("go")
         procs.append(proc)
-    for proc in procs:
-        proc.join()
+    try:
+        for proc in procs:
+            proc.join()
+    finally:
+        for backend in backends:
+            backend.terminate()
+        for backend in backends:
+            try:
+                backend.wait(timeout=5)
+            except Exception:
+                pass
     reasons = []
     for _ in procs:
         try:
