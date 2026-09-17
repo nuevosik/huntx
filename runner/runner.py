@@ -5,11 +5,15 @@ import importlib.util
 import json
 import multiprocessing
 import os
+import re
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -92,6 +96,101 @@ def claim_next(repo, owner, session=None):
             hx.save_hyps(repo, hyps)
             return hyp
     return None
+
+
+HOST_RE = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}|[a-z0-9][a-z0-9.-]*\.[a-z]{2,})\b", re.I)
+NETNS_BACKENDS = ("slirp4netns", "pasta")
+OPENCODE_DIR = Path(os.environ.get("OPENCODE_DIR", Path.home() / ".config" / "opencode"))
+OPENCODE_MODELS = Path(os.environ.get("OPENCODE_MODELS", Path.home() / ".cache" / "opencode" / "models.json"))
+OPENCODE_AUTH = Path(os.environ.get("OPENCODE_AUTH", Path.home() / ".local" / "share" / "opencode" / "auth.json"))
+
+
+def hosts_in_text(text):
+    return {match.group(1).lower().rstrip(".") for match in HOST_RE.finditer(text or "")}
+
+
+def strip_jsonc(text):
+    return re.sub(r'("(?:[^"\\]|\\.)*")|//[^\n]*', lambda match: match.group(1) or "", text)
+
+
+def opencode_egress_hosts(config_dir=None, models_cache=None, auth_file=None):
+    config_dir = Path(config_dir or OPENCODE_DIR)
+    models_cache = Path(models_cache or OPENCODE_MODELS)
+    auth_file = Path(auth_file or OPENCODE_AUTH)
+    hosts = set()
+    config_path = config_dir / "opencode.jsonc"
+    config = {}
+    if config_path.exists():
+        try:
+            config = json.loads(strip_jsonc(config_path.read_text()))
+        except Exception:
+            config = {}
+    for server in (config.get("mcp") or {}).values():
+        if isinstance(server, dict) and server.get("type") == "remote" and server.get("url"):
+            host = urlparse(server["url"]).hostname
+            if host:
+                hosts.add(host.lower())
+    providers = set((config.get("provider") or {}).keys())
+    for key in ("model", "small_model"):
+        value = config.get(key)
+        if isinstance(value, str) and "/" in value:
+            providers.add(value.split("/", 1)[0])
+    auth = hx.load_json(auth_file, {})
+    if isinstance(auth, dict):
+        providers |= set(auth.keys())
+    models = hx.load_json(models_cache, {})
+    for provider in providers:
+        entry = models.get(provider) or {}
+        host = urlparse(entry.get("api") or "").hostname
+        if host:
+            hosts.add(host.lower())
+    return hosts
+
+
+def netns_allow_hosts(repo, hyp=None, config_dir=None, models_cache=None, auth_file=None):
+    scope = repo.scope()
+    hosts = {entry.lower().lstrip("*.") for entry in (scope.get("in_scope") or [])}
+    if hyp:
+        hosts |= hosts_in_text(hyp.get("endpoint"))
+    target = repo.hunt / "TARGET.md"
+    if target.exists():
+        for host in hosts_in_text(target.read_text()):
+            if hx.check_scope(scope, f"https://{host}/")[0]:
+                hosts.add(host)
+    provider_hosts = opencode_egress_hosts(config_dir, models_cache, auth_file)
+    hosts |= provider_hosts
+    extras = (scope.get("netns") or {}).get("allow_hosts") or []
+    hosts |= {host.lower() for host in extras}
+    if not provider_hosts and not extras:
+        raise hx.HxError("netns: provedor LLM nao derivavel e sem netns.allow_hosts — worker recusado", hx.EXIT_GUARD)
+    return hosts
+
+
+def resolve_ips(hosts, resolver=None):
+    ips = set()
+    for host in hosts:
+        try:
+            if resolver:
+                addresses = resolver(host)
+            else:
+                addresses = [info[4][0] for info in socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)]
+        except OSError:
+            continue
+        for address in addresses or []:
+            ips.add(address)
+    return ips
+
+
+def netns_resolvers():
+    resolvers = []
+    path = Path("/etc/resolv.conf")
+    if not path.exists():
+        return resolvers
+    for line in path.read_text().splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "nameserver" and not parts[1].startswith("127."):
+            resolvers.append(parts[1])
+    return resolvers
 
 
 PROMPT_TEMPLATE = """Você executa UMA fatia de caça (work order). Não explore além dela.
