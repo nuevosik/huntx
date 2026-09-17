@@ -40,6 +40,8 @@
 - Cada fatia vira um record em `hunt/runs.jsonl`.
 - Paradas: fila vazia, `--slices`/`--wall`/caps (`--max-tokens`, `--max-cost`) esgotados ou `runner.stop` presente.
 - Sessão morta (só com probes no scope e `session_tag` na hipótese): a hipótese fecha `blocked` e o runner segue.
+- Com `--netns`, egress do worker é só o allowlist do netns (in_scope + host da hipótese + TARGET.md + provedor/MCPs + `netns.allow_hosts`); host novo fora disso → fatia fecha `blocked` — registre o host no scope.json e re-rode.
+- --netns: host do colaborador do callback (`hx verify`) precisa estar em `netns.allow_hosts`; draft não autoriza egress.
 - Kill: `touch hunt/runner.stop` (honrado entre fatias e entre retries; a tentativa em voo roda até o timeout); SIGINT/SIGTERM no processo pedem a mesma parada. Retome com `rm hunt/runner.stop` — o start do próximo runner também limpa o latch.
 
 ## Planner e debrief

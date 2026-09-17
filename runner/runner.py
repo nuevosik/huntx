@@ -5,11 +5,16 @@ import importlib.util
 import json
 import multiprocessing
 import os
+import re
+import select
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -92,6 +97,157 @@ def claim_next(repo, owner, session=None):
             hx.save_hyps(repo, hyps)
             return hyp
     return None
+
+
+HOST_RE = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}|[a-z0-9][a-z0-9.-]*\.[a-z]{2,})\b", re.I)
+NETNS_BACKENDS = ("slirp4netns",)
+OPENCODE_DIR = Path(os.environ.get("OPENCODE_DIR", Path.home() / ".config" / "opencode"))
+OPENCODE_MODELS = Path(os.environ.get("OPENCODE_MODELS", Path.home() / ".cache" / "opencode" / "models.json"))
+OPENCODE_AUTH = Path(os.environ.get("OPENCODE_AUTH", Path.home() / ".local" / "share" / "opencode" / "auth.json"))
+
+
+def hosts_in_text(text):
+    return {match.group(1).lower().rstrip(".") for match in HOST_RE.finditer(text or "")}
+
+
+def strip_jsonc(text):
+    return re.sub(r'("(?:[^"\\]|\\.)*")|//[^\n]*', lambda match: match.group(1) or "", text)
+
+
+def opencode_egress_hosts(config_dir=None, models_cache=None, auth_file=None):
+    config_dir = Path(config_dir or OPENCODE_DIR)
+    models_cache = Path(models_cache or OPENCODE_MODELS)
+    auth_file = Path(auth_file or OPENCODE_AUTH)
+    hosts = set()
+    config_path = config_dir / "opencode.jsonc"
+    config = {}
+    if config_path.exists():
+        try:
+            config = json.loads(strip_jsonc(config_path.read_text()))
+        except Exception:
+            config = {}
+    for server in (config.get("mcp") or {}).values():
+        if isinstance(server, dict) and server.get("type") == "remote" and server.get("url"):
+            host = urlparse(server["url"]).hostname
+            if host:
+                hosts.add(host.lower())
+    providers = set((config.get("provider") or {}).keys())
+    for key in ("model", "small_model"):
+        value = config.get(key)
+        if isinstance(value, str) and "/" in value:
+            providers.add(value.split("/", 1)[0])
+    auth = hx.load_json(auth_file, {})
+    if isinstance(auth, dict):
+        providers |= set(auth.keys())
+    models = hx.load_json(models_cache, {})
+    for provider in providers:
+        entry = models.get(provider) or {}
+        host = urlparse(entry.get("api") or "").hostname
+        if host:
+            hosts.add(host.lower())
+    return hosts
+
+
+def netns_allow_hosts(repo, hyp=None, config_dir=None, models_cache=None, auth_file=None):
+    scope = repo.scope()
+    hosts = {entry.lower().lstrip("*.") for entry in (scope.get("in_scope") or [])}
+    if hyp:
+        hosts |= hosts_in_text(hyp.get("endpoint"))
+    target = repo.hunt / "TARGET.md"
+    if target.exists():
+        for host in hosts_in_text(target.read_text()):
+            if hx.check_scope(scope, f"https://{host}/")[0]:
+                hosts.add(host)
+    provider_hosts = opencode_egress_hosts(config_dir, models_cache, auth_file)
+    hosts |= provider_hosts
+    extras = (scope.get("netns") or {}).get("allow_hosts") or []
+    hosts |= {host.lower() for host in extras}
+    if not provider_hosts and not extras:
+        raise hx.HxError("netns: provedor LLM nao derivavel e sem netns.allow_hosts — worker recusado", hx.EXIT_GUARD)
+    return hosts
+
+
+def resolve_ips(hosts, resolver=None):
+    ips = set()
+    for host in hosts:
+        try:
+            if resolver:
+                addresses = resolver(host)
+            else:
+                addresses = [info[4][0] for info in socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)]
+        except OSError:
+            continue
+        for address in addresses or []:
+            ips.add(address)
+    return ips
+
+
+def netns_resolvers():
+    resolvers = []
+    path = Path("/etc/resolv.conf")
+    if not path.exists():
+        return resolvers
+    for line in path.read_text().splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "nameserver" and not parts[1].startswith("127."):
+            if ":" in parts[1]:
+                continue
+            resolvers.append(parts[1])
+    return resolvers
+
+
+def netns_ruleset(ips, resolvers):
+    if not ips:
+        raise hx.HxError("netns: regras vazias — allowlist sem IP resolvido", hx.EXIT_GUARD)
+    lines = [
+        "table inet hx",
+        "delete table inet hx",
+        "table inet hx {",
+        "  set allowed {",
+        "    type ipv4_addr",
+        f"    elements = {{ {', '.join(sorted(ips))} }}",
+        "  }",
+        "  chain out {",
+        "    type filter hook output priority 0; policy drop;",
+        "    oif lo accept",
+        "    ip daddr @allowed accept",
+    ]
+    for resolver in resolvers:
+        lines.append(f"    ip daddr {resolver} udp dport 53 accept")
+        lines.append(f"    ip daddr {resolver} tcp dport 53 accept")
+    lines.append("  }")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def apply_netns_rules(ips, resolvers):
+    result = subprocess.run(["nft", "-f", "-"], input=netns_ruleset(ips, resolvers), capture_output=True, text=True)
+    if result.returncode != 0:
+        raise hx.HxError(f"netns: nft falhou: {(result.stderr or '').strip()[:200]}", hx.EXIT_GUARD)
+
+
+def netns_preflight():
+    problems = []
+    if not shutil.which("nft"):
+        problems.append("nft ausente")
+    if not any(shutil.which(name) for name in NETNS_BACKENDS):
+        problems.append("backend de NAT ausente (instale slirp4netns)")
+    if not shutil.which("setpriv"):
+        problems.append("setpriv ausente (util-linux)")
+    try:
+        probe = subprocess.run(["unshare", "-Ur", "true"], capture_output=True, text=True, timeout=10)
+    except Exception as exc:
+        problems.append(f"unshare -Ur falhou: {exc}")
+    else:
+        if probe.returncode != 0:
+            problems.append("unshare -Ur indisponivel (user namespaces desabilitados)")
+    return problems
+
+
+def agent_argv(argv):
+    if os.environ.get("HX_NETNS") == "1":
+        return ["setpriv", "--bounding-set=-net_admin", "--"] + list(argv)
+    return list(argv)
 
 
 PROMPT_TEMPLATE = """Você executa UMA fatia de caça (work order). Não explore além dela.
@@ -197,7 +353,7 @@ def invoke_opencode(prompt, cwd, config_content, timeout_s, model=None, resume_s
     env["OPENCODE_CONFIG_CONTENT"] = config_content
     if env_extra:
         env.update(env_extra)
-    argv = ["opencode", "run", "--format", "json"]
+    argv = agent_argv(["opencode", "run", "--format", "json"])
     if model:
         argv += ["--model", model]
     if resume_session:
@@ -494,12 +650,32 @@ def release_claim(repo, hyp_id):
     return False
 
 
+def netns_worker_enter(ctx):
+    os.unshare(os.CLONE_NEWNET)
+    ctx["netns_ctrl"].send("netns")
+    if ctx["netns_ctrl"].recv() != "go":
+        raise hx.HxError("netns: supervisor nao confirmou a criacao do namespace", hx.EXIT_GUARD)
+    try:
+        Path("/proc/sys/net/ipv6/conf/all/disable_ipv6").write_text("1")
+    except OSError:
+        pass
+    ips = resolve_ips(netns_allow_hosts(ctx["repo"]))
+    apply_netns_rules(ips, netns_resolvers())
+
+
+def netns_refresh(ctx, hyp):
+    ips = resolve_ips(netns_allow_hosts(ctx["repo"], hyp))
+    apply_netns_rules(ips, netns_resolvers())
+
+
 def worker_loop(ctx):
     repo = ctx["repo"]
     budget = ctx["budget"]
     worker = ctx.get("worker")
     owner = ctx.get("owner") or f"runner-{os.getpid()}"
     os.environ["HX_SESSION"] = owner
+    if ctx.get("netns"):
+        netns_worker_enter(ctx)
     while True:
         reason = check_stop(ctx)
         if reason:
@@ -507,6 +683,8 @@ def worker_loop(ctx):
         hyp = claim_next(repo, owner, worker)
         if hyp is None:
             return "empty_queue"
+        if ctx.get("netns"):
+            netns_refresh(ctx, hyp)
         if not runner_state_reserve_slice(repo, budget["slices_max"]):
             release_claim(repo, hyp["id"])
             return "slices"
@@ -520,7 +698,39 @@ def worker_loop(ctx):
 
 
 def worker_entry(queue, ctx):
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     queue.put(worker_loop(ctx))
+
+
+def start_netns_backend(pid, backend):
+    if backend != "slirp4netns":
+        raise hx.HxError(f"netns: backend nao suportado: {backend}", hx.EXIT_GUARD)
+    read_fd, write_fd = os.pipe()
+    try:
+        proc = subprocess.Popen(
+            ["slirp4netns", "--configure", "--mtu=65520", "--disable-host-loopback", f"--ready-fd={write_fd}", str(pid), "tap0"],
+            pass_fds=(write_fd,),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        os.close(read_fd)
+        os.close(write_fd)
+        raise hx.HxError("netns: slirp4netns nao iniciou", hx.EXIT_GUARD)
+    os.close(write_fd)
+    payload = b""
+    ready, _, _ = select.select([read_fd], [], [], 30)
+    if ready:
+        payload = os.read(read_fd, 1)
+    os.close(read_fd)
+    if not payload:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        raise hx.HxError("netns: slirp4netns nao ficou pronto", hx.EXIT_GUARD)
+    return proc
 
 
 def run_workers(ctx, workers):
@@ -528,16 +738,48 @@ def run_workers(ctx, workers):
     probes = (repo.scope().get("health") or {}).get("probes") or []
     proc_ctx = multiprocessing.get_context("fork")
     queue = proc_ctx.Queue()
+    netns = bool(ctx.get("netns"))
     procs = []
-    for i in range(workers):
-        wctx = dict(ctx)
-        wctx["worker"] = probes[i]["session"]
-        wctx["owner"] = probes[i]["session"]
-        proc = proc_ctx.Process(target=worker_entry, args=(queue, wctx))
-        proc.start()
-        procs.append(proc)
-    for proc in procs:
-        proc.join()
+    backends = []
+    try:
+        for i in range(workers):
+            session = probes[i]["session"] if i < len(probes) else None
+            if workers <= 1:
+                session = None
+            wctx = dict(ctx)
+            wctx["worker"] = session
+            wctx["owner"] = session or f"runner-{os.getpid()}"
+            parent_ctrl = None
+            if netns:
+                parent_ctrl, child_ctrl = proc_ctx.Pipe()
+                wctx["netns_ctrl"] = child_ctrl
+            proc = proc_ctx.Process(target=worker_entry, args=(queue, wctx))
+            proc.start()
+            procs.append(proc)
+            if netns:
+                child_ctrl.close()
+                if not parent_ctrl.poll(30):
+                    raise hx.HxError("netns: worker nao criou o namespace", hx.EXIT_GUARD)
+                try:
+                    parent_ctrl.recv()
+                except EOFError:
+                    raise hx.HxError("netns: worker morreu antes do namespace", hx.EXIT_GUARD)
+                backends.append(start_netns_backend(proc.pid, ctx.get("backend") or "slirp4netns"))
+                parent_ctrl.send("go")
+                parent_ctrl.close()
+        for proc in procs:
+            proc.join()
+    finally:
+        for backend in backends:
+            backend.terminate()
+        for backend in backends:
+            try:
+                backend.wait(timeout=5)
+            except Exception:
+                pass
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
     reasons = []
     for _ in procs:
         try:
@@ -545,6 +787,84 @@ def run_workers(ctx, workers):
         except Exception:
             reasons.append("crashed")
     return reasons
+
+
+def netns_selfcheck_child(child_ctrl):
+    try:
+        os.unshare(os.CLONE_NEWNET)
+        child_ctrl.send("netns")
+        if child_ctrl.recv() != "go":
+            os._exit(3)
+        try:
+            Path("/proc/sys/net/ipv6/conf/all/disable_ipv6").write_text("1")
+        except OSError:
+            pass
+        ips = resolve_ips({"localhost"})
+        ips.add("127.0.0.1")
+        apply_netns_rules(ips, netns_resolvers())
+        checks = {}
+        route = Path("/proc/net/route").read_text() if Path("/proc/net/route").exists() else ""
+        checks["default_route"] = any(line.split()[1] == "00000000" for line in route.splitlines()[1:])
+        try:
+            with socket.create_connection(("192.0.2.1", 443), timeout=3):
+                checks["out_of_scope_blocked"] = False
+        except OSError:
+            checks["out_of_scope_blocked"] = True
+        result = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True)
+        checks["rules_present"] = "policy drop" in (result.stdout or "")
+        tamper = subprocess.run(["setpriv", "--bounding-set=-net_admin", "--", "nft", "add", "table", "inet", "tamper"], capture_output=True, text=True)
+        checks["agent_cannot_tamper"] = tamper.returncode != 0
+        print(json.dumps(checks), flush=True)
+        os._exit(0 if all(checks.values()) else 1)
+    except Exception as err:
+        print(json.dumps({"error": str(err)[:200]}), flush=True)
+        os._exit(2)
+
+
+def netns_selfcheck():
+    proc_ctx = multiprocessing.get_context("fork")
+    children = []
+    backends = []
+    codes = []
+    try:
+        for _ in range(2):
+            parent_ctrl, child_ctrl = proc_ctx.Pipe()
+            pid = os.fork()
+            if pid == 0:
+                parent_ctrl.close()
+                netns_selfcheck_child(child_ctrl)
+            child_ctrl.close()
+            if not parent_ctrl.poll(30):
+                os.kill(pid, signal.SIGKILL)
+                print(json.dumps({"error": "child nao criou o netns"}))
+                return 2
+            try:
+                parent_ctrl.recv()
+            except EOFError:
+                print(json.dumps({"error": "child morreu antes do namespace"}, ensure_ascii=False))
+                return 2
+            reaped, _ = os.waitpid(pid, os.WNOHANG)
+            if reaped == pid:
+                print(json.dumps({"error": "child morreu antes do namespace"}))
+                return 2
+            backends.append(start_netns_backend(pid, "slirp4netns"))
+            parent_ctrl.send("go")
+            children.append(pid)
+        for pid in children:
+            _, status = os.waitpid(pid, 0)
+            codes.append(os.waitstatus_to_exitcode(status))
+    finally:
+        for backend in backends:
+            backend.terminate()
+        for backend in backends:
+            try:
+                backend.wait(timeout=5)
+            except Exception:
+                pass
+    if all(code == 0 for code in codes):
+        print("SELFCHECK OK")
+        return 0
+    return next((code for code in codes if code != 0), 1)
 
 
 def runner_main(argv=None):
@@ -557,9 +877,13 @@ def runner_main(argv=None):
     parser.add_argument("--plan", action="store_true")
     parser.add_argument("--plan-n", dest="plan_n", type=int, default=5)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--netns", action="store_true")
+    parser.add_argument("--netns-selfcheck", dest="netns_selfcheck", action="store_true")
     parser.add_argument("--max-tokens", dest="max_tokens", type=int, default=None)
     parser.add_argument("--max-cost", dest="max_cost", type=float, default=None)
     args = parser.parse_args(argv)
+    if args.netns_selfcheck:
+        return netns_selfcheck()
     repo = hx.Repo(Path(args.engagement).resolve())
     pid_file = repo.hunt / "runner.pid"
     if pid_file.exists():
@@ -580,6 +904,20 @@ def runner_main(argv=None):
     if args.plan and args.workers > 1:
         print("runner: --plan nao combina com --workers > 1")
         return 2
+    if args.netns and not shutil.which("unshare"):
+        print("runner: unshare ausente (util-linux)")
+        return 2
+    raw_argv = list(argv if argv is not None else sys.argv[1:])
+    if args.netns and os.environ.get("HX_NETNS") != "1":
+        env = dict(os.environ, HX_NETNS="1")
+        os.execvpe("unshare", ["unshare", "-Ur", "--", sys.executable, str(Path(__file__).resolve()), *raw_argv], env)
+    if args.netns:
+        problems = netns_preflight()
+        if problems:
+            print("runner: --netns indisponivel:")
+            for problem in problems:
+                print(f"  - {problem}")
+            return 2
     problems = workers_gate(repo, args.workers)
     if problems:
         print("runner: gate de workers recusou:")
@@ -597,6 +935,7 @@ def runner_main(argv=None):
         "repo": repo, "hyp": None, "brief": "", "config": config, "owner": owner,
         "model": args.model, "budget": budget, "started_ts": hx.now(),
         "no_adjudicate": args.no_adjudicate, "plan_n": args.plan_n,
+        "netns": args.netns,
     }
     try:
         write_pid(repo)
@@ -605,14 +944,17 @@ def runner_main(argv=None):
             run_plan(ctx)
             return 0
         runner_state_init(repo)
-        if args.workers <= 1:
-            print(f"runner: parada ({worker_loop(ctx)})")
-        else:
-            reasons = run_workers(ctx, args.workers)
+        if args.netns or args.workers > 1:
+            reasons = run_workers(ctx, max(args.workers, 1))
             for reason in reasons:
                 print(f"runner: worker parada ({reason})")
             if "crashed" in reasons:
                 return 1
+        else:
+            print(f"runner: parada ({worker_loop(ctx)})")
+    except hx.HxError as err:
+        print(f"runner: {err}")
+        return 2
     finally:
         (repo.hunt / "runner.pid").unlink(missing_ok=True)
     return 0
