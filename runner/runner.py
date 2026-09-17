@@ -35,6 +35,47 @@ def load_hx(repo_root=REPO_ROOT):
 
 hx = load_hx()
 
+RUNNER_STATE_DEFAULTS = {"started_ts": 0, "slices": 0, "tokens": 0, "cost": 0.0}
+
+
+def runner_state_path(repo):
+    return repo.hunt / ".runnerstate.json"
+
+
+def runner_state_read(repo):
+    return {**RUNNER_STATE_DEFAULTS, **hx.load_json(runner_state_path(repo), {})}
+
+
+def runner_state_init(repo):
+    with hx.flock(repo.hunt / ".lock.runner"):
+        hx.dump_json(runner_state_path(repo), {**RUNNER_STATE_DEFAULTS, "started_ts": hx.now()})
+
+
+def runner_state_add(repo, tokens=0, cost=0.0):
+    with hx.flock(repo.hunt / ".lock.runner"):
+        state = runner_state_read(repo)
+        state["tokens"] += tokens or 0
+        state["cost"] += cost or 0.0
+        hx.dump_json(runner_state_path(repo), state)
+        return state
+
+
+def runner_state_reserve_slice(repo, slices_max):
+    with hx.flock(repo.hunt / ".lock.runner"):
+        state = runner_state_read(repo)
+        if state["slices"] >= slices_max:
+            return False
+        state["slices"] += 1
+        hx.dump_json(runner_state_path(repo), state)
+        return True
+
+
+def runner_state_release_slice(repo):
+    with hx.flock(repo.hunt / ".lock.runner"):
+        state = runner_state_read(repo)
+        state["slices"] = max(0, state["slices"] - 1)
+        hx.dump_json(runner_state_path(repo), state)
+
 
 def claim_next(repo, owner):
     with hx.flock(repo.hunt / ".lock.hyps"):
@@ -379,13 +420,12 @@ def check_stop(ctx):
     budget = ctx["budget"]
     if (repo.hunt / "runner.stop").exists():
         return "kill"
-    if ctx["slices_done"] >= budget["slices_max"]:
-        return "slices"
-    if hx.now() - ctx["started_ts"] >= budget["wall_s"]:
+    state = runner_state_read(repo)
+    if hx.now() - state["started_ts"] >= budget["wall_s"]:
         return "wall"
-    if budget.get("token_cap") and ctx["tokens_used"] >= budget["token_cap"]:
+    if budget.get("token_cap") and state["tokens"] >= budget["token_cap"]:
         return "tokens"
-    if budget.get("cost_cap") and ctx["cost_used"] >= budget["cost_cap"]:
+    if budget.get("cost_cap") and state["cost"] >= budget["cost_cap"]:
         return "cost"
     if claim_peek_empty(repo):
         return "empty_queue"
