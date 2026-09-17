@@ -2,6 +2,7 @@ export const SCAN_BINARIES = ["curl", "wget", "nuclei", "ffuf", "naabu", "dnsx",
 
 const WRAPPERS = new Set(["sudo", "env", "command", "time", "nice", "nohup"]);
 const IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/;
+const SUBSTITUTION_RE = /\$\(|`|<\(|>\(/;
 
 function stripBrackets(host) {
   const value = (host || "").toLowerCase();
@@ -69,6 +70,9 @@ export function decideBash(scope, command) {
   const trimmed = command.trim();
   const segments = trimmed.split(/[;\n]|&&|\|\|?/).map((segment) => segment.trim()).filter(Boolean);
   if (segments.length > 0 && segments.every((segment) => segment === "hx" || segment.startsWith("hx "))) {
+    if (SUBSTITUTION_RE.test(trimmed)) {
+      return { action: "block", reason: "substituicao de comando nos argumentos do hx — proibido" };
+    }
     return { action: "allow", reason: "hx path" };
   }
   const offenders = new Set();
