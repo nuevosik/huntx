@@ -229,7 +229,7 @@ def netns_preflight():
     if not shutil.which("nft"):
         problems.append("nft ausente")
     if not any(shutil.which(name) for name in NETNS_BACKENDS):
-        problems.append("backend de NAT ausente (instale slirp4netns ou pasta)")
+        problems.append("backend de NAT ausente (instale slirp4netns)")
     if not shutil.which("setpriv"):
         problems.append("setpriv ausente (util-linux)")
     try:
@@ -716,17 +716,18 @@ def start_netns_backend(pid, backend):
         os.close(write_fd)
         raise hx.HxError("netns: slirp4netns nao iniciou", hx.EXIT_GUARD)
     os.close(write_fd)
+    payload = b""
     ready, _, _ = select.select([read_fd], [], [], 30)
-    if not ready:
-        os.close(read_fd)
+    if ready:
+        payload = os.read(read_fd, 1)
+    os.close(read_fd)
+    if not payload:
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except Exception:
             pass
         raise hx.HxError("netns: slirp4netns nao ficou pronto", hx.EXIT_GUARD)
-    os.read(read_fd, 1)
-    os.close(read_fd)
     return proc
 
 
@@ -755,7 +756,10 @@ def run_workers(ctx, workers):
                 child_ctrl.close()
                 if not parent_ctrl.poll(30):
                     raise hx.HxError("netns: worker nao criou o namespace", hx.EXIT_GUARD)
-                parent_ctrl.recv()
+                try:
+                    parent_ctrl.recv()
+                except EOFError:
+                    raise hx.HxError("netns: worker morreu antes do namespace", hx.EXIT_GUARD)
                 backends.append(start_netns_backend(proc.pid, ctx.get("backend") or "slirp4netns"))
                 parent_ctrl.send("go")
                 parent_ctrl.close()
