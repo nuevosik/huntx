@@ -768,7 +768,7 @@ def http_request(session, method, url, headers, body):
 
 def fetch(method, url, headers=None, body=None, cookies=None):
     from curl_cffi import requests as creq
-    session = creq.Session(impersonate="chrome131", trust_env=False)
+    session = creq.Session(impersonate="chrome131", trust_env=False, proxies={"all": ""})
     for cookie in cookies or []:
         session.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain", ""), path=cookie.get("path", "/"))
     try:
