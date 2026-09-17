@@ -63,11 +63,11 @@ BRIEF:
 
 REGRAS:
 - Toda saída de rede via `hx run`; mutação fora de allowed_mutations estagia (exit 5) — não insista.
-- Feche com `hx result {id} --verdict ... --note ...` (confirmed exige finding verificado).
+- FECHAMENTO OBRIGATÓRIO: sua ÚLTIMA ação DEVE ser `hx result {id} --verdict ... --note ...` (ou `hx release {id}` se nem começou). Sem isso o supervisor fecha a hipótese como blocked.
+- O resumo (veredito, evidência, o que falta) vai na `--note` do result.
 - Para `confirmed`: monte o draft em `hunt/FINDINGS/drafts/{id}.json` (cenário differential/echo/callback conforme o caso) e rode `hx verify {id}`; só então `hx result {id} --verdict confirmed`.
 - Hipótese nova descoberta: `hx hypothesis add ...`.
-- Sem conclusão em {minutes} min: `hx result {id} --verdict blocked --note "give_up"` e pare.
-- Termine com um resumo curto: veredito, evidência, o que falta."""
+- Sem conclusão em {minutes} min: `hx result {id} --verdict blocked --note "give_up"` e pare."""
 
 
 def build_prompt(hyp, brief_text, slice_timeout_s):
