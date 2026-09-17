@@ -266,6 +266,7 @@ BRIEF:
 
 REGRAS:
 - Toda saída de rede via `hx run`; mutação fora de allowed_mutations estagia (exit 5) — não insista.
+- Nao rode `hx next`: trabalhe somente a hipotese {id} desta fatia.
 - FECHAMENTO OBRIGATÓRIO: sua ÚLTIMA ação DEVE ser `hx result {id} --verdict ... --note ...` (ou `hx release {id}` se nem começou). Sem isso o supervisor fecha a hipótese como blocked.
 - O resumo (veredito, evidência, o que falta) vai na `--note` do result.
 - Para `confirmed`: monte o draft em `hunt/FINDINGS/drafts/{id}.json` (cenário differential/echo/callback conforme o caso) e rode `hx verify {id}`; só então `hx result {id} --verdict confirmed`.
