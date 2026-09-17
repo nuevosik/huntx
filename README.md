@@ -44,6 +44,8 @@ One worker, one slice at a time: claims from the queue, spawns `opencode run` wi
 
 Com `--workers N` (fase 3.1): supervisor + N processos worker, cada um preso a uma sessão distinta de `scope.health.probes` (`HX_SESSION` + claim filtrado por `session_tag`); orçamento agregado em `hunt/.runnerstate.json`; `runner.stop` para todos. Gate no start (exit 2): `N ≤ probes`, hipóteses `open` ≥ 20, hosts in-scope ≥ 2 — a wave de campo (3.0) é decisão do dj registrada no debrief.
 
+`--netns` (fase 3.2): cada worker roda num network namespace próprio com nft default-drop e allowlist por IP (escopo + host da hipótese + provedor LLM/MCPs derivados + `netns.allow_hosts` do scope.json), re-resolvida a cada fatia; agente spawnado com `setpriv --bounding-set=-net_admin` (não mexe nas regras). Requer `slirp4netns`, `nft` e `setpriv`; faltando algo o runner recusa (exit 2). Opt-in; o endpoint do proxy não é alcançável de dentro do netns (o agente de fatia não tem browser).
+
 ## Planner (opt-in)
 
 ```bash
