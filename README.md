@@ -42,6 +42,8 @@ python3 runner/runner.py --engagement ~/hunts/target --slices 5 --wall 3600
 
 One worker, one slice at a time: claims from the queue, spawns `opencode run` with a `hunt-auto` agent injected inline via `OPENCODE_CONFIG_CONTENT` (no symlink, nothing written to your opencode config), adjudicates the draft with `hx verify` when one exists, then appends the slice record to `hunt/runs.jsonl`. Budgets: `--slices`, `--wall`, and the optional `--max-tokens`/`--max-cost` caps; the loop also stops on an empty queue. `touch hunt/runner.stop` is honored between slices and between retries — an in-flight attempt runs to its timeout, then the runner stops (SIGINT/SIGTERM request the same stop). Resume with `rm hunt/runner.stop`; the latch is also cleared at the next runner start.
 
+Com `--workers N` (fase 3.1): supervisor + N processos worker, cada um preso a uma sessão distinta de `scope.health.probes` (`HX_SESSION` + claim filtrado por `session_tag`); orçamento agregado em `hunt/.runnerstate.json`; `runner.stop` para todos. Gate no start (exit 2): `N ≤ probes`, hipóteses `open` ≥ 20, hosts in-scope ≥ 2 — a wave de campo (3.0) é decisão do dj registrada no debrief.
+
 ## Planner (opt-in)
 
 ```bash

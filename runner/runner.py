@@ -3,6 +3,7 @@ import argparse
 import importlib.machinery
 import importlib.util
 import json
+import multiprocessing
 import os
 import signal
 import subprocess
@@ -35,12 +36,55 @@ def load_hx(repo_root=REPO_ROOT):
 
 hx = load_hx()
 
+RUNNER_STATE_DEFAULTS = {"started_ts": 0, "slices": 0, "tokens": 0, "cost": 0.0}
 
-def claim_next(repo, owner):
+
+def runner_state_path(repo):
+    return repo.hunt / ".runnerstate.json"
+
+
+def runner_state_read(repo):
+    return {**RUNNER_STATE_DEFAULTS, **hx.load_json(runner_state_path(repo), {})}
+
+
+def runner_state_init(repo):
+    with hx.flock(repo.hunt / ".lock.runner"):
+        hx.dump_json(runner_state_path(repo), {**RUNNER_STATE_DEFAULTS, "started_ts": hx.now()})
+
+
+def runner_state_add(repo, tokens=0, cost=0.0):
+    with hx.flock(repo.hunt / ".lock.runner"):
+        state = runner_state_read(repo)
+        state["tokens"] += tokens or 0
+        state["cost"] += cost or 0.0
+        hx.dump_json(runner_state_path(repo), state)
+        return state
+
+
+def runner_state_reserve_slice(repo, slices_max):
+    with hx.flock(repo.hunt / ".lock.runner"):
+        state = runner_state_read(repo)
+        if state["slices"] >= slices_max:
+            return False
+        state["slices"] += 1
+        hx.dump_json(runner_state_path(repo), state)
+        return True
+
+
+def runner_state_release_slice(repo):
+    with hx.flock(repo.hunt / ".lock.runner"):
+        state = runner_state_read(repo)
+        state["slices"] = max(0, state["slices"] - 1)
+        hx.dump_json(runner_state_path(repo), state)
+
+
+def claim_next(repo, owner, session=None):
     with hx.flock(repo.hunt / ".lock.hyps"):
         hyps, _ = hx.load_hyps(repo)
         for hyp in hyps:
             if hyp["status"] != "open":
+                continue
+            if session and hyp.get("session_tag") not in (None, session):
                 continue
             hyp["status"] = "claimed"
             hyp["owner"] = owner
@@ -290,6 +334,7 @@ def run_slice(ctx):
         "ts": hx.now(),
         "hyp": hyp["id"],
         "session": session,
+        "worker": ctx.get("worker"),
         "rc": rc,
         "tokens": usage.get("tokens"),
         "cost": usage.get("cost"),
@@ -379,13 +424,12 @@ def check_stop(ctx):
     budget = ctx["budget"]
     if (repo.hunt / "runner.stop").exists():
         return "kill"
-    if ctx["slices_done"] >= budget["slices_max"]:
-        return "slices"
-    if hx.now() - ctx["started_ts"] >= budget["wall_s"]:
+    state = runner_state_read(repo)
+    if hx.now() - state["started_ts"] >= budget["wall_s"]:
         return "wall"
-    if budget.get("token_cap") and ctx["tokens_used"] >= budget["token_cap"]:
+    if budget.get("token_cap") and state["tokens"] >= budget["token_cap"]:
         return "tokens"
-    if budget.get("cost_cap") and ctx["cost_used"] >= budget["cost_cap"]:
+    if budget.get("cost_cap") and state["cost"] >= budget["cost_cap"]:
         return "cost"
     if claim_peek_empty(repo):
         return "empty_queue"
@@ -415,6 +459,94 @@ def build_config_content(agent_md_path, plan=False):
     return json.dumps(config)
 
 
+def workers_gate(repo, workers):
+    if workers <= 1:
+        return []
+    scope = repo.scope()
+    probes = (scope.get("health") or {}).get("probes") or []
+    hyps, _ = hx.load_hyps(repo)
+    open_count = sum(1 for hyp in hyps if hyp.get("status") == "open")
+    host_count = len(scope.get("in_scope") or [])
+    problems = []
+    if workers > len(probes):
+        problems.append(f"--workers {workers} > sessoes nos probes ({len(probes)})")
+    if open_count < 20:
+        problems.append(f"hipoteses abertas {open_count} < 20")
+    if host_count < 2:
+        problems.append(f"hosts in-scope {host_count} < 2")
+    return problems
+
+
+def claim_ttl_for(budget):
+    return max(hx.TTL_CLAIM_S, budget["backoff_attempts"] * budget["slice_timeout_s"] + 300)
+
+
+def release_claim(repo, hyp_id):
+    with hx.flock(repo.hunt / ".lock.hyps"):
+        hyps, _ = hx.load_hyps(repo)
+        for hyp in hyps:
+            if hyp["id"] == hyp_id and hyp["status"] in ("claimed", "running"):
+                hyp["status"] = "open"
+                hyp["owner"] = None
+                hyp["claimed_ts"] = None
+                hx.save_hyps(repo, hyps)
+                return True
+    return False
+
+
+def worker_loop(ctx):
+    repo = ctx["repo"]
+    budget = ctx["budget"]
+    worker = ctx.get("worker")
+    owner = ctx.get("owner") or f"runner-{os.getpid()}"
+    os.environ["HX_SESSION"] = owner
+    while True:
+        reason = check_stop(ctx)
+        if reason:
+            return reason
+        hyp = claim_next(repo, owner, worker)
+        if hyp is None:
+            return "empty_queue"
+        if not runner_state_reserve_slice(repo, budget["slices_max"]):
+            release_claim(repo, hyp["id"])
+            return "slices"
+        alive, tag = health_gate(hx, repo, hyp)
+        if not alive:
+            hx.main(["result", hyp["id"], "--verdict", "blocked", "--note", f"sessao {tag} morta"])
+            continue
+        ctx["hyp"] = hyp
+        record = run_slice(ctx)
+        runner_state_add(repo, tokens=record.get("tokens") or 0, cost=record.get("cost") or 0)
+
+
+def worker_entry(queue, ctx):
+    queue.put(worker_loop(ctx))
+
+
+def run_workers(ctx, workers):
+    repo = ctx["repo"]
+    probes = (repo.scope().get("health") or {}).get("probes") or []
+    proc_ctx = multiprocessing.get_context("fork")
+    queue = proc_ctx.Queue()
+    procs = []
+    for i in range(workers):
+        wctx = dict(ctx)
+        wctx["worker"] = probes[i]["session"]
+        wctx["owner"] = probes[i]["session"]
+        proc = proc_ctx.Process(target=worker_entry, args=(queue, wctx))
+        proc.start()
+        procs.append(proc)
+    for proc in procs:
+        proc.join()
+    reasons = []
+    for _ in procs:
+        try:
+            reasons.append(queue.get(timeout=1))
+        except Exception:
+            reasons.append("crashed")
+    return reasons
+
+
 def runner_main(argv=None):
     parser = argparse.ArgumentParser(prog="runner")
     parser.add_argument("--engagement", default=".")
@@ -424,6 +556,7 @@ def runner_main(argv=None):
     parser.add_argument("--no-adjudicate", action="store_true")
     parser.add_argument("--plan", action="store_true")
     parser.add_argument("--plan-n", dest="plan_n", type=int, default=5)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--max-tokens", dest="max_tokens", type=int, default=None)
     parser.add_argument("--max-cost", dest="max_cost", type=float, default=None)
     args = parser.parse_args(argv)
@@ -444,15 +577,25 @@ def runner_main(argv=None):
         if other_pid is not None:
             print(f"runner: ja existe runner vivo (pid {other_pid})")
             return 1
+    if args.plan and args.workers > 1:
+        print("runner: --plan nao combina com --workers > 1")
+        return 2
+    problems = workers_gate(repo, args.workers)
+    if problems:
+        print("runner: gate de workers recusou:")
+        for problem in problems:
+            print(f"  - {problem}")
+        return 2
     (repo.hunt / "runner.stop").unlink(missing_ok=True)
     os.environ["HX_ENGAGEMENT"] = str(repo.eng)
     owner = f"runner-{os.getpid()}"
     os.environ["HX_SESSION"] = owner
     budget = {**DEFAULTS, "slices_max": args.slices, "wall_s": args.wall, "token_cap": args.max_tokens, "cost_cap": args.max_cost}
+    hx.TTL_CLAIM_S = claim_ttl_for(budget)
     config = os.environ.get("RUNNER_CONFIG_CONTENT") or build_config_content(REPO_ROOT / "opencode" / "agents" / "hunt-auto.md", plan=args.plan)
     ctx = {
         "repo": repo, "hyp": None, "brief": "", "config": config, "owner": owner,
-        "model": args.model, "budget": budget, "started_ts": hx.now(), "slices_done": 0, "tokens_used": 0, "cost_used": 0,
+        "model": args.model, "budget": budget, "started_ts": hx.now(),
         "no_adjudicate": args.no_adjudicate, "plan_n": args.plan_n,
     }
     try:
@@ -461,25 +604,15 @@ def runner_main(argv=None):
         if args.plan:
             run_plan(ctx)
             return 0
-        while True:
-            reason = check_stop(ctx)
-            if reason:
-                print(f"runner: parada ({reason})")
-                break
-            hyp = claim_next(repo, owner)
-            if hyp is None:
-                print("runner: fila vazia")
-                break
-            alive, tag = health_gate(hx, repo, hyp)
-            if not alive:
-                hx.main(["result", hyp["id"], "--verdict", "blocked", "--note", f"sessao {tag} morta"])
-                ctx["slices_done"] += 1
-                continue
-            ctx["hyp"] = hyp
-            record = run_slice(ctx)
-            ctx["slices_done"] += 1
-            ctx["tokens_used"] += record.get("tokens") or 0
-            ctx["cost_used"] += record.get("cost") or 0
+        runner_state_init(repo)
+        if args.workers <= 1:
+            print(f"runner: parada ({worker_loop(ctx)})")
+        else:
+            reasons = run_workers(ctx, args.workers)
+            for reason in reasons:
+                print(f"runner: worker parada ({reason})")
+            if "crashed" in reasons:
+                return 1
     finally:
         (repo.hunt / "runner.pid").unlink(missing_ok=True)
     return 0
