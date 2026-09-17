@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 import re
+import select
 import shutil
 import signal
 import socket
@@ -99,7 +100,7 @@ def claim_next(repo, owner, session=None):
 
 
 HOST_RE = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}|[a-z0-9][a-z0-9.-]*\.[a-z]{2,})\b", re.I)
-NETNS_BACKENDS = ("slirp4netns", "pasta")
+NETNS_BACKENDS = ("slirp4netns",)
 OPENCODE_DIR = Path(os.environ.get("OPENCODE_DIR", Path.home() / ".config" / "opencode"))
 OPENCODE_MODELS = Path(os.environ.get("OPENCODE_MODELS", Path.home() / ".cache" / "opencode" / "models.json"))
 OPENCODE_AUTH = Path(os.environ.get("OPENCODE_AUTH", Path.home() / ".local" / "share" / "opencode" / "auth.json"))
@@ -695,6 +696,7 @@ def worker_loop(ctx):
 
 
 def worker_entry(queue, ctx):
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     queue.put(worker_loop(ctx))
 
 
@@ -702,18 +704,29 @@ def start_netns_backend(pid, backend):
     if backend != "slirp4netns":
         raise hx.HxError(f"netns: backend nao suportado: {backend}", hx.EXIT_GUARD)
     read_fd, write_fd = os.pipe()
-    proc = subprocess.Popen(
-        ["slirp4netns", "--configure", "--mtu=65520", "--disable-host-loopback", f"--ready-fd={write_fd}", str(pid)],
-        pass_fds=(write_fd,),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    try:
+        proc = subprocess.Popen(
+            ["slirp4netns", "--configure", "--mtu=65520", "--disable-host-loopback", f"--ready-fd={write_fd}", str(pid)],
+            pass_fds=(write_fd,),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        os.close(read_fd)
+        os.close(write_fd)
+        raise hx.HxError("netns: slirp4netns nao iniciou", hx.EXIT_GUARD)
     os.close(write_fd)
-    ready = os.read(read_fd, 1)
-    os.close(read_fd)
+    ready, _, _ = select.select([read_fd], [], [], 30)
     if not ready:
+        os.close(read_fd)
         proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
         raise hx.HxError("netns: slirp4netns nao ficou pronto", hx.EXIT_GUARD)
+    os.read(read_fd, 1)
+    os.close(read_fd)
     return proc
 
 
@@ -739,11 +752,13 @@ def run_workers(ctx, workers):
             proc.start()
             procs.append(proc)
             if netns:
+                child_ctrl.close()
                 if not parent_ctrl.poll(30):
                     raise hx.HxError("netns: worker nao criou o namespace", hx.EXIT_GUARD)
                 parent_ctrl.recv()
                 backends.append(start_netns_backend(proc.pid, ctx.get("backend") or "slirp4netns"))
                 parent_ctrl.send("go")
+                parent_ctrl.close()
         for proc in procs:
             proc.join()
     finally:
