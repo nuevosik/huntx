@@ -193,6 +193,60 @@ def netns_resolvers():
     return resolvers
 
 
+def netns_ruleset(ips, resolvers):
+    if not ips:
+        raise hx.HxError("netns: regras vazias — allowlist sem IP resolvido", hx.EXIT_GUARD)
+    lines = [
+        "table inet hx",
+        "delete table inet hx",
+        "table inet hx {",
+        "  set allowed {",
+        "    type ipv4_addr",
+        f"    elements = {{ {', '.join(sorted(ips))} }}",
+        "  }",
+        "  chain out {",
+        "    type filter hook output priority 0; policy drop;",
+        "    oif lo accept",
+        "    ip daddr @allowed accept",
+    ]
+    for resolver in resolvers:
+        lines.append(f"    ip daddr {resolver} udp dport 53 accept")
+        lines.append(f"    ip daddr {resolver} tcp dport 53 accept")
+    lines.append("  }")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def apply_netns_rules(ips, resolvers):
+    result = subprocess.run(["nft", "-f", "-"], input=netns_ruleset(ips, resolvers), capture_output=True, text=True)
+    if result.returncode != 0:
+        raise hx.HxError(f"netns: nft falhou: {(result.stderr or '').strip()[:200]}", hx.EXIT_GUARD)
+
+
+def netns_preflight():
+    problems = []
+    if not shutil.which("nft"):
+        problems.append("nft ausente")
+    if not any(shutil.which(name) for name in NETNS_BACKENDS):
+        problems.append("backend de NAT ausente (instale slirp4netns ou pasta)")
+    if not shutil.which("setpriv"):
+        problems.append("setpriv ausente (util-linux)")
+    try:
+        probe = subprocess.run(["unshare", "-Ur", "true"], capture_output=True, text=True, timeout=10)
+    except Exception as exc:
+        problems.append(f"unshare -Ur falhou: {exc}")
+    else:
+        if probe.returncode != 0:
+            problems.append("unshare -Ur indisponivel (user namespaces desabilitados)")
+    return problems
+
+
+def agent_argv(argv):
+    if os.environ.get("HX_NETNS") == "1":
+        return ["setpriv", "--bounding-set=-net_admin", "--"] + list(argv)
+    return list(argv)
+
+
 PROMPT_TEMPLATE = """Você executa UMA fatia de caça (work order). Não explore além dela.
 
 HIPÓTESE [{id}] — {claim}
