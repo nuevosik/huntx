@@ -725,25 +725,25 @@ def run_workers(ctx, workers):
     netns = bool(ctx.get("netns"))
     procs = []
     backends = []
-    for i in range(workers):
-        wctx = dict(ctx)
-        session = probes[i]["session"] if i < len(probes) else None
-        wctx["worker"] = session
-        wctx["owner"] = session or f"runner-{os.getpid()}"
-        parent_ctrl = None
-        if netns:
-            parent_ctrl, child_ctrl = proc_ctx.Pipe()
-            wctx["netns_ctrl"] = child_ctrl
-        proc = proc_ctx.Process(target=worker_entry, args=(queue, wctx))
-        proc.start()
-        if netns:
-            if not parent_ctrl.poll(30):
-                raise hx.HxError("netns: worker nao criou o namespace", hx.EXIT_GUARD)
-            parent_ctrl.recv()
-            backends.append(start_netns_backend(proc.pid, ctx.get("backend") or "slirp4netns"))
-            parent_ctrl.send("go")
-        procs.append(proc)
     try:
+        for i in range(workers):
+            session = probes[i]["session"] if i < len(probes) else None
+            wctx = dict(ctx)
+            wctx["worker"] = session
+            wctx["owner"] = session or f"runner-{os.getpid()}"
+            parent_ctrl = None
+            if netns:
+                parent_ctrl, child_ctrl = proc_ctx.Pipe()
+                wctx["netns_ctrl"] = child_ctrl
+            proc = proc_ctx.Process(target=worker_entry, args=(queue, wctx))
+            proc.start()
+            procs.append(proc)
+            if netns:
+                if not parent_ctrl.poll(30):
+                    raise hx.HxError("netns: worker nao criou o namespace", hx.EXIT_GUARD)
+                parent_ctrl.recv()
+                backends.append(start_netns_backend(proc.pid, ctx.get("backend") or "slirp4netns"))
+                parent_ctrl.send("go")
         for proc in procs:
             proc.join()
     finally:
@@ -754,6 +754,9 @@ def run_workers(ctx, workers):
                 backend.wait(timeout=5)
             except Exception:
                 pass
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
     reasons = []
     for _ in procs:
         try:
