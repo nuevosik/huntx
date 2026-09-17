@@ -790,6 +790,7 @@ def netns_selfcheck():
     parent_ctrl, child_ctrl = proc_ctx.Pipe()
     pid = os.fork()
     if pid == 0:
+        parent_ctrl.close()
         try:
             os.unshare(os.CLONE_NEWNET)
             child_ctrl.send("netns")
@@ -823,7 +824,11 @@ def netns_selfcheck():
         os.kill(pid, signal.SIGKILL)
         print(json.dumps({"error": "child nao criou o netns"}))
         return 2
-    parent_ctrl.recv()
+    try:
+        parent_ctrl.recv()
+    except EOFError:
+        print(json.dumps({"error": "child morreu antes do namespace"}, ensure_ascii=False))
+        return 2
     backend = start_netns_backend(pid, "slirp4netns")
     parent_ctrl.send("go")
     try:
