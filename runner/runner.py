@@ -820,6 +820,7 @@ def netns_selfcheck():
         except Exception as err:
             print(json.dumps({"error": str(err)[:200]}), flush=True)
             os._exit(2)
+    child_ctrl.close()
     if not parent_ctrl.poll(30):
         os.kill(pid, signal.SIGKILL)
         print(json.dumps({"error": "child nao criou o netns"}))
@@ -828,6 +829,10 @@ def netns_selfcheck():
         parent_ctrl.recv()
     except EOFError:
         print(json.dumps({"error": "child morreu antes do namespace"}, ensure_ascii=False))
+        return 2
+    reaped, _ = os.waitpid(pid, os.WNOHANG)
+    if reaped == pid:
+        print(json.dumps({"error": "child morreu antes do namespace"}))
         return 2
     backend = start_netns_backend(pid, "slirp4netns")
     parent_ctrl.send("go")
