@@ -2,6 +2,7 @@
 import argparse
 import fcntl
 import hashlib
+import html
 import json
 import os
 import re
@@ -1069,8 +1070,16 @@ def run_echo(repo, scope, draft):
     status, headers, body = guarded_fetch(repo, scope, request["method"], url, draft.get("session"), draft.get("headers"))
     lowered_body = body.lower()
     raw_present = payload in body
-    escapes = [f"&lt;hx{canary}", f"&#60;hx{canary}", f"&#x3c;hx{canary}"]
-    escaped_present = any(token in lowered_body for token in escapes)
+    escaped_forms = {
+        html.escape(payload),
+        html.escape(payload, quote=True),
+        payload.replace("<", "&#60;").replace(">", "&#62;"),
+        payload.replace("<", "&#x3c;").replace(">", "&#x3e;"),
+    }
+    for lt in ("&lt;", "&#60;", "&#x3c;"):
+        for gt in ("&gt;", "&#62;", "&#x3e;"):
+            escaped_forms.add(payload.replace("<", lt).replace(">", gt))
+    escaped_present = any(form and form.lower() in lowered_body for form in escaped_forms)
     index = body.find(payload)
     snippet = body[max(0, index - 80): index + len(payload) + 80] if index >= 0 else ""
     output_dir = repo.hunt / "FINDINGS" / "drafts" / draft["id"]
