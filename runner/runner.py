@@ -457,6 +457,24 @@ def build_config_content(agent_md_path, plan=False):
     return json.dumps(config)
 
 
+def workers_gate(repo, workers):
+    if workers <= 1:
+        return []
+    scope = repo.scope()
+    probes = (scope.get("health") or {}).get("probes") or []
+    hyps, _ = hx.load_hyps(repo)
+    open_count = sum(1 for hyp in hyps if hyp.get("status") == "open")
+    host_count = len(scope.get("in_scope") or [])
+    problems = []
+    if workers > len(probes):
+        problems.append(f"--workers {workers} > sessoes nos probes ({len(probes)})")
+    if open_count < 20:
+        problems.append(f"hipoteses abertas {open_count} < 20")
+    if host_count < 2:
+        problems.append(f"hosts in-scope {host_count} < 2")
+    return problems
+
+
 def runner_main(argv=None):
     parser = argparse.ArgumentParser(prog="runner")
     parser.add_argument("--engagement", default=".")
@@ -466,6 +484,7 @@ def runner_main(argv=None):
     parser.add_argument("--no-adjudicate", action="store_true")
     parser.add_argument("--plan", action="store_true")
     parser.add_argument("--plan-n", dest="plan_n", type=int, default=5)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--max-tokens", dest="max_tokens", type=int, default=None)
     parser.add_argument("--max-cost", dest="max_cost", type=float, default=None)
     args = parser.parse_args(argv)
@@ -486,6 +505,15 @@ def runner_main(argv=None):
         if other_pid is not None:
             print(f"runner: ja existe runner vivo (pid {other_pid})")
             return 1
+    if args.plan and args.workers > 1:
+        print("runner: --plan nao combina com --workers > 1")
+        return 2
+    problems = workers_gate(repo, args.workers)
+    if problems:
+        print("runner: gate de workers recusou:")
+        for problem in problems:
+            print(f"  - {problem}")
+        return 2
     (repo.hunt / "runner.stop").unlink(missing_ok=True)
     os.environ["HX_ENGAGEMENT"] = str(repo.eng)
     owner = f"runner-{os.getpid()}"
