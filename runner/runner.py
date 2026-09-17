@@ -3,6 +3,7 @@ import argparse
 import importlib.machinery
 import importlib.util
 import json
+import multiprocessing
 import os
 import signal
 import subprocess
@@ -333,6 +334,7 @@ def run_slice(ctx):
         "ts": hx.now(),
         "hyp": hyp["id"],
         "session": session,
+        "worker": ctx.get("worker"),
         "rc": rc,
         "tokens": usage.get("tokens"),
         "cost": usage.get("cost"),
@@ -475,6 +477,59 @@ def workers_gate(repo, workers):
     return problems
 
 
+def worker_loop(ctx):
+    repo = ctx["repo"]
+    budget = ctx["budget"]
+    worker = ctx.get("worker")
+    owner = ctx.get("owner") or f"runner-{os.getpid()}"
+    os.environ["HX_SESSION"] = owner
+    while True:
+        reason = check_stop(ctx)
+        if reason:
+            return reason
+        if not runner_state_reserve_slice(repo, budget["slices_max"]):
+            return "slices"
+        hyp = claim_next(repo, owner, worker)
+        if hyp is None:
+            runner_state_release_slice(repo)
+            return "empty_queue"
+        alive, tag = health_gate(hx, repo, hyp)
+        if not alive:
+            hx.main(["result", hyp["id"], "--verdict", "blocked", "--note", f"sessao {tag} morta"])
+            continue
+        ctx["hyp"] = hyp
+        record = run_slice(ctx)
+        runner_state_add(repo, tokens=record.get("tokens") or 0, cost=record.get("cost") or 0)
+
+
+def worker_entry(queue, ctx):
+    queue.put(worker_loop(ctx))
+
+
+def run_workers(ctx, workers):
+    repo = ctx["repo"]
+    probes = (repo.scope().get("health") or {}).get("probes") or []
+    proc_ctx = multiprocessing.get_context("fork")
+    queue = proc_ctx.Queue()
+    procs = []
+    for i in range(workers):
+        wctx = dict(ctx)
+        wctx["worker"] = probes[i]["session"]
+        wctx["owner"] = probes[i]["session"]
+        proc = proc_ctx.Process(target=worker_entry, args=(queue, wctx))
+        proc.start()
+        procs.append(proc)
+    reasons = []
+    for _ in procs:
+        try:
+            reasons.append(queue.get(timeout=30))
+        except Exception:
+            reasons.append("crashed")
+    for proc in procs:
+        proc.join()
+    return reasons
+
+
 def runner_main(argv=None):
     parser = argparse.ArgumentParser(prog="runner")
     parser.add_argument("--engagement", default=".")
@@ -522,7 +577,7 @@ def runner_main(argv=None):
     config = os.environ.get("RUNNER_CONFIG_CONTENT") or build_config_content(REPO_ROOT / "opencode" / "agents" / "hunt-auto.md", plan=args.plan)
     ctx = {
         "repo": repo, "hyp": None, "brief": "", "config": config, "owner": owner,
-        "model": args.model, "budget": budget, "started_ts": hx.now(), "slices_done": 0, "tokens_used": 0, "cost_used": 0,
+        "model": args.model, "budget": budget, "started_ts": hx.now(),
         "no_adjudicate": args.no_adjudicate, "plan_n": args.plan_n,
     }
     try:
@@ -531,25 +586,12 @@ def runner_main(argv=None):
         if args.plan:
             run_plan(ctx)
             return 0
-        while True:
-            reason = check_stop(ctx)
-            if reason:
-                print(f"runner: parada ({reason})")
-                break
-            hyp = claim_next(repo, owner)
-            if hyp is None:
-                print("runner: fila vazia")
-                break
-            alive, tag = health_gate(hx, repo, hyp)
-            if not alive:
-                hx.main(["result", hyp["id"], "--verdict", "blocked", "--note", f"sessao {tag} morta"])
-                ctx["slices_done"] += 1
-                continue
-            ctx["hyp"] = hyp
-            record = run_slice(ctx)
-            ctx["slices_done"] += 1
-            ctx["tokens_used"] += record.get("tokens") or 0
-            ctx["cost_used"] += record.get("cost") or 0
+        runner_state_init(repo)
+        if args.workers <= 1:
+            print(f"runner: parada ({worker_loop(ctx)})")
+        else:
+            for reason in run_workers(ctx, args.workers):
+                print(f"runner: worker parada ({reason})")
     finally:
         (repo.hunt / "runner.pid").unlink(missing_ok=True)
     return 0
