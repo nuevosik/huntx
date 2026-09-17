@@ -190,6 +190,8 @@ def netns_resolvers():
     for line in path.read_text().splitlines():
         parts = line.split()
         if len(parts) >= 2 and parts[0] == "nameserver" and not parts[1].startswith("127."):
+            if ":" in parts[1]:
+                continue
             resolvers.append(parts[1])
     return resolvers
 
@@ -742,6 +744,8 @@ def run_workers(ctx, workers):
     try:
         for i in range(workers):
             session = probes[i]["session"] if i < len(probes) else None
+            if workers <= 1:
+                session = None
             wctx = dict(ctx)
             wctx["worker"] = session
             wctx["owner"] = session or f"runner-{os.getpid()}"
@@ -785,69 +789,82 @@ def run_workers(ctx, workers):
     return reasons
 
 
+def netns_selfcheck_child(child_ctrl):
+    try:
+        os.unshare(os.CLONE_NEWNET)
+        child_ctrl.send("netns")
+        if child_ctrl.recv() != "go":
+            os._exit(3)
+        try:
+            Path("/proc/sys/net/ipv6/conf/all/disable_ipv6").write_text("1")
+        except OSError:
+            pass
+        ips = resolve_ips({"localhost"})
+        ips.add("127.0.0.1")
+        apply_netns_rules(ips, netns_resolvers())
+        checks = {}
+        route = Path("/proc/net/route").read_text() if Path("/proc/net/route").exists() else ""
+        checks["default_route"] = any(line.split()[1] == "00000000" for line in route.splitlines()[1:])
+        try:
+            with socket.create_connection(("192.0.2.1", 443), timeout=3):
+                checks["out_of_scope_blocked"] = False
+        except OSError:
+            checks["out_of_scope_blocked"] = True
+        result = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True)
+        checks["rules_present"] = "policy drop" in (result.stdout or "")
+        tamper = subprocess.run(["setpriv", "--bounding-set=-net_admin", "--", "nft", "add", "table", "inet", "tamper"], capture_output=True, text=True)
+        checks["agent_cannot_tamper"] = tamper.returncode != 0
+        print(json.dumps(checks), flush=True)
+        os._exit(0 if all(checks.values()) else 1)
+    except Exception as err:
+        print(json.dumps({"error": str(err)[:200]}), flush=True)
+        os._exit(2)
+
+
 def netns_selfcheck():
     proc_ctx = multiprocessing.get_context("fork")
-    parent_ctrl, child_ctrl = proc_ctx.Pipe()
-    pid = os.fork()
-    if pid == 0:
-        parent_ctrl.close()
-        try:
-            os.unshare(os.CLONE_NEWNET)
-            child_ctrl.send("netns")
-            if child_ctrl.recv() != "go":
-                os._exit(3)
-            try:
-                Path("/proc/sys/net/ipv6/conf/all/disable_ipv6").write_text("1")
-            except OSError:
-                pass
-            ips = resolve_ips({"localhost"})
-            ips.add("127.0.0.1")
-            apply_netns_rules(ips, netns_resolvers())
-            checks = {}
-            route = Path("/proc/net/route").read_text() if Path("/proc/net/route").exists() else ""
-            checks["default_route"] = any(line.split()[1] == "00000000" for line in route.splitlines()[1:])
-            try:
-                with socket.create_connection(("192.0.2.1", 443), timeout=3):
-                    checks["out_of_scope_blocked"] = False
-            except OSError:
-                checks["out_of_scope_blocked"] = True
-            result = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True)
-            checks["rules_present"] = "policy drop" in (result.stdout or "")
-            tamper = subprocess.run(["setpriv", "--bounding-set=-net_admin", "--", "nft", "add", "table", "inet", "tamper"], capture_output=True, text=True)
-            checks["agent_cannot_tamper"] = tamper.returncode != 0
-            print(json.dumps(checks), flush=True)
-            os._exit(0 if all(checks.values()) else 1)
-        except Exception as err:
-            print(json.dumps({"error": str(err)[:200]}), flush=True)
-            os._exit(2)
-    child_ctrl.close()
-    if not parent_ctrl.poll(30):
-        os.kill(pid, signal.SIGKILL)
-        print(json.dumps({"error": "child nao criou o netns"}))
-        return 2
+    children = []
+    backends = []
+    codes = []
     try:
-        parent_ctrl.recv()
-    except EOFError:
-        print(json.dumps({"error": "child morreu antes do namespace"}, ensure_ascii=False))
-        return 2
-    reaped, _ = os.waitpid(pid, os.WNOHANG)
-    if reaped == pid:
-        print(json.dumps({"error": "child morreu antes do namespace"}))
-        return 2
-    backend = start_netns_backend(pid, "slirp4netns")
-    parent_ctrl.send("go")
-    try:
-        _, status = os.waitpid(pid, 0)
+        for _ in range(2):
+            parent_ctrl, child_ctrl = proc_ctx.Pipe()
+            pid = os.fork()
+            if pid == 0:
+                parent_ctrl.close()
+                netns_selfcheck_child(child_ctrl)
+            child_ctrl.close()
+            if not parent_ctrl.poll(30):
+                os.kill(pid, signal.SIGKILL)
+                print(json.dumps({"error": "child nao criou o netns"}))
+                return 2
+            try:
+                parent_ctrl.recv()
+            except EOFError:
+                print(json.dumps({"error": "child morreu antes do namespace"}, ensure_ascii=False))
+                return 2
+            reaped, _ = os.waitpid(pid, os.WNOHANG)
+            if reaped == pid:
+                print(json.dumps({"error": "child morreu antes do namespace"}))
+                return 2
+            backends.append(start_netns_backend(pid, "slirp4netns"))
+            parent_ctrl.send("go")
+            children.append(pid)
+        for pid in children:
+            _, status = os.waitpid(pid, 0)
+            codes.append(os.waitstatus_to_exitcode(status))
     finally:
-        backend.terminate()
-        try:
-            backend.wait(timeout=5)
-        except Exception:
-            pass
-    code = os.waitstatus_to_exitcode(status)
-    if code == 0:
+        for backend in backends:
+            backend.terminate()
+        for backend in backends:
+            try:
+                backend.wait(timeout=5)
+            except Exception:
+                pass
+    if all(code == 0 for code in codes):
         print("SELFCHECK OK")
-    return code
+        return 0
+    return next((code for code in codes if code != 0), 1)
 
 
 def runner_main(argv=None):
@@ -886,6 +903,9 @@ def runner_main(argv=None):
             return 1
     if args.plan and args.workers > 1:
         print("runner: --plan nao combina com --workers > 1")
+        return 2
+    if args.netns and not shutil.which("unshare"):
+        print("runner: unshare ausente (util-linux)")
         return 2
     raw_argv = list(argv if argv is not None else sys.argv[1:])
     if args.netns and os.environ.get("HX_NETNS") != "1":
@@ -932,6 +952,9 @@ def runner_main(argv=None):
                 return 1
         else:
             print(f"runner: parada ({worker_loop(ctx)})")
+    except hx.HxError as err:
+        print(f"runner: {err}")
+        return 2
     finally:
         (repo.hunt / "runner.pid").unlink(missing_ok=True)
     return 0
