@@ -77,11 +77,13 @@ def runner_state_release_slice(repo):
         hx.dump_json(runner_state_path(repo), state)
 
 
-def claim_next(repo, owner):
+def claim_next(repo, owner, session=None):
     with hx.flock(repo.hunt / ".lock.hyps"):
         hyps, _ = hx.load_hyps(repo)
         for hyp in hyps:
             if hyp["status"] != "open":
+                continue
+            if session and hyp.get("session_tag") not in (None, session):
                 continue
             hyp["status"] = "claimed"
             hyp["owner"] = owner
