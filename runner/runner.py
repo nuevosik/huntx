@@ -86,16 +86,19 @@ def runner_state_release_slice(repo):
 def claim_next(repo, owner, session=None):
     with hx.flock(repo.hunt / ".lock.hyps"):
         hyps, _ = hx.load_hyps(repo)
-        for hyp in hyps:
-            if hyp["status"] != "open":
-                continue
-            if session and hyp.get("session_tag") not in (None, session):
-                continue
-            hyp["status"] = "claimed"
-            hyp["owner"] = owner
-            hyp["claimed_ts"] = hx.now()
-            hx.save_hyps(repo, hyps)
-            return hyp
+        for planner in (False, True):
+            for hyp in hyps:
+                if hyp["status"] != "open":
+                    continue
+                if session and hyp.get("session_tag") not in (None, session):
+                    continue
+                if (hyp.get("source") == "planner") != planner:
+                    continue
+                hyp["status"] = "claimed"
+                hyp["owner"] = owner
+                hyp["claimed_ts"] = hx.now()
+                hx.save_hyps(repo, hyps)
+                return hyp
     return None
 
 
