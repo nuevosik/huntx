@@ -635,6 +635,10 @@ def rate_effective_interval(scope, state, host):
 def rate_acquire(scope, repo, host, max_wait):
     with flock(repo.hunt / ".lock.rate"):
         state = load_json(repo.rate, {})
+        cooldown = (state.get("cooldowns") or {}).get(host)
+        if cooldown and cooldown.get("until", 0) > now():
+            remaining = int(cooldown["until"] - now())
+            raise HxError(f"waf cooldown: {host} pausado por mais {remaining}s (nivel {cooldown.get('count', 1)}) — retomada manual: hx rate reset", EXIT_RATE)
         interval = rate_effective_interval(scope, state, host)
         global_interval = float(scope["rate"].get("global_interval_s", 0.5))
         t = now()
@@ -665,6 +669,18 @@ def rate_step_up(scope, repo, host, cause):
         return new
 
 
+def rate_waf_cooldown(scope, repo, host):
+    with flock(repo.hunt / ".lock.rate"):
+        state = load_json(repo.rate, {})
+        entry = state.setdefault("cooldowns", {}).setdefault(host, {"count": 0, "until": 0})
+        entry["count"] += 1
+        minutes = min(120, 30 * (2 ** (entry["count"] - 1)))
+        entry["until"] = now() + minutes * 60
+        state.setdefault("events", []).append({"ts": now(), "host": host, "cause": "waf-cooldown", "minutes": minutes})
+        dump_json(repo.rate, state)
+        return minutes
+
+
 def cmd_rate_show(args):
     repo = repo_from_cwd()
     print(json.dumps(load_json(repo.rate, {}), indent=1))
@@ -677,9 +693,10 @@ def cmd_rate_reset(args):
     with flock(repo.hunt / ".lock.rate"):
         state = load_json(repo.rate, {})
         state["effective"] = {}
+        state["cooldowns"] = {}
         state.setdefault("events", []).append({"ts": now(), "host": "*", "cause": "manual reset", "interval": None})
         dump_json(repo.rate, state)
-    print("rate reiniciado — piso restaurado")
+    print("rate reiniciado — piso e cooldowns restaurados")
 
 
 HASH_HEADERS = re.compile(r"(?i)^(cookie|set-cookie|authorization)$|token")
@@ -799,7 +816,8 @@ def apply_health_signals(repo, scope, host, status, headers, body):
     for sig in health_cfg.get("waf_block_if", []):
         if signal_matches(sig, status, headers, body):
             rate_step_up(scope, repo, host, "waf-marker")
-            audit(repo, "hx run", "health", host, "step-up", sig)
+            minutes = rate_waf_cooldown(scope, repo, host)
+            audit(repo, "hx run", "health", host, "cooldown", f"{minutes}min")
             return
 
 
@@ -850,6 +868,7 @@ def probe_once(repo, scope, tag):
             return False, "ratelimit"
     for sig in scope["health"]["waf_block_if"]:
         if signal_matches(sig, status, headers, body):
+            rate_waf_cooldown(scope, repo, host)
             return False, "waf"
     for sig in scope["health"]["session_invalid_if"]:
         if signal_matches(sig, status, headers, body):

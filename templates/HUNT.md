@@ -20,6 +20,7 @@
 - Hipótese nova → `hx hypothesis add ...`.
 - Sessão suspeita → `hx health check --session <tag>`.
 - Probes contam no rate; nada de "tráfego de sistema".
+- `waf_block_if` marcado → cooldown do host (30→60→120min, dobra a cada reincidência); retomada manual: `hx rate reset`.
 
 ## Cenários do verify
 
