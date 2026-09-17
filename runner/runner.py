@@ -477,6 +477,19 @@ def workers_gate(repo, workers):
     return problems
 
 
+def release_claim(repo, hyp_id):
+    with hx.flock(repo.hunt / ".lock.hyps"):
+        hyps, _ = hx.load_hyps(repo)
+        for hyp in hyps:
+            if hyp["id"] == hyp_id and hyp["status"] in ("claimed", "running"):
+                hyp["status"] = "open"
+                hyp["owner"] = None
+                hyp["claimed_ts"] = None
+                hx.save_hyps(repo, hyps)
+                return True
+    return False
+
+
 def worker_loop(ctx):
     repo = ctx["repo"]
     budget = ctx["budget"]
@@ -487,12 +500,12 @@ def worker_loop(ctx):
         reason = check_stop(ctx)
         if reason:
             return reason
-        if not runner_state_reserve_slice(repo, budget["slices_max"]):
-            return "slices"
         hyp = claim_next(repo, owner, worker)
         if hyp is None:
-            runner_state_release_slice(repo)
             return "empty_queue"
+        if not runner_state_reserve_slice(repo, budget["slices_max"]):
+            release_claim(repo, hyp["id"])
+            return "slices"
         alive, tag = health_gate(hx, repo, hyp)
         if not alive:
             hx.main(["result", hyp["id"], "--verdict", "blocked", "--note", f"sessao {tag} morta"])
@@ -519,14 +532,14 @@ def run_workers(ctx, workers):
         proc = proc_ctx.Process(target=worker_entry, args=(queue, wctx))
         proc.start()
         procs.append(proc)
+    for proc in procs:
+        proc.join()
     reasons = []
     for _ in procs:
         try:
-            reasons.append(queue.get(timeout=30))
+            reasons.append(queue.get(timeout=1))
         except Exception:
             reasons.append("crashed")
-    for proc in procs:
-        proc.join()
     return reasons
 
 
