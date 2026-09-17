@@ -374,7 +374,7 @@ def refute_gate(repo, hyp):
     if entry.get("dead_since"):
         raise HxError(f"sessao {tag} morta — use --verdict blocked", EXIT_SESSION)
     if not health_fresh(repo, tag, fresh_s):
-        ok, signal = probe_once(repo, scope, tag)
+        ok, signal, _, _ = probe_once(repo, scope, tag)
         declared = health_probe_result(repo, tag, ok, signal)
         if declared:
             reopened = reopen_sweep(repo, tag, health_get(repo, tag)["dead_since"])
@@ -838,12 +838,12 @@ def health_get(repo, tag):
     return health_load(repo).get(tag, default)
 
 
-def health_probe_result(repo, tag, ok, signal):
+def health_probe_result(repo, tag, ok, signal, status=None, excerpt=None):
     with flock(repo.hunt / ".lock.health"):
         state = health_load(repo)
         entry = state.setdefault(tag, {"strikes": 0, "first_strike": None, "dead_since": None, "suspect_since": None, "probes": []})
         ts = now()
-        entry["probes"].append({"ts": ts, "ok": ok, "signal": signal})
+        entry["probes"].append({"ts": ts, "ok": ok, "signal": signal, "status": status, "excerpt": excerpt})
         declared = False
         if ok:
             entry["strikes"] = 0
@@ -871,17 +871,18 @@ def probe_once(repo, scope, tag):
     max_wait = float(scope["rate"].get("max_wait_s", 30))
     rate_acquire(scope, repo, host, max_wait)
     status, headers, body = fetch(probe["method"], probe["url"], probe.get("headers"), None, cookies)
+    excerpt = re.sub(r"\s+", " ", body or "").strip()[:160]
     for sig in scope["health"]["rate_limited_if"]:
         if signal_matches(sig, status, headers, body):
-            return False, "ratelimit"
+            return False, "ratelimit", status, excerpt
     for sig in scope["health"]["waf_block_if"]:
         if signal_matches(sig, status, headers, body):
             rate_waf_cooldown(scope, repo, host)
-            return False, "waf"
+            return False, "waf", status, excerpt
     for sig in scope["health"]["session_invalid_if"]:
         if signal_matches(sig, status, headers, body):
-            return False, "invalid"
-    return True, None
+            return False, "invalid", status, excerpt
+    return True, None, status, excerpt
 
 
 def health_fresh(repo, tag, fresh_s):
@@ -918,12 +919,14 @@ def cmd_health_check(args):
     probes = scope["health"]["probes"]
     tags = [args.session] if args.session and args.session != "all" else [p["session"] for p in probes]
     for tag in tags:
-        ok, signal = probe_once(repo, scope, tag)
+        ok, signal, status, excerpt = probe_once(repo, scope, tag)
         if signal == "ratelimit":
             probe = next(p for p in probes if p["session"] == tag)
             rate_step_up(scope, repo, urlparse(probe["url"]).hostname or "", "probe-429")
-        declared = health_probe_result(repo, tag, ok, signal)
-        print(f"{tag}: {'ok' if ok else signal}")
+        declared = health_probe_result(repo, tag, ok, signal, status, excerpt)
+        detail = f" (http {status})" if status is not None else ""
+        tail = f" — {excerpt}" if excerpt else ""
+        print(f"{tag}: {'ok' if ok else signal}{detail}{tail}")
         if declared:
             entry = health_get(repo, tag)
             reopened = reopen_sweep(repo, tag, entry["dead_since"])

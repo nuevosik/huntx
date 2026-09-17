@@ -341,8 +341,8 @@ def health_gate(hx_mod, repo, hyp):
     fresh_s = float((scope.get("health") or {}).get("fresh_max_s", 600))
     if not hx_mod.health_fresh(repo, tag, fresh_s):
         try:
-            ok, sig = hx_mod.probe_once(repo, scope, tag)
-            declared = hx_mod.health_probe_result(repo, tag, ok, sig)
+            ok, sig, status, excerpt = hx_mod.probe_once(repo, scope, tag)
+            declared = hx_mod.health_probe_result(repo, tag, ok, sig, status, excerpt)
             if declared:
                 hx_mod.reopen_sweep(repo, tag, hx_mod.health_get(repo, tag)["dead_since"])
         except hx_mod.HxError as err:
