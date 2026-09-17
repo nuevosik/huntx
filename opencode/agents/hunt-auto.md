@@ -12,4 +12,4 @@ Mesma disciplina do agente `hunt`, em modo headless:
 - Sem `ask` em lugar nenhum — o que não tem permissão é negado e reportado no resultado.
 - Toda saída de rede via `hx run`; mutações estagiam (exit 5) e a fatia fecha como `blocked (staged)`.
 - Refute com sessão morta/suspeita fecha como `blocked (session)`.
-- Encerre o trabalho com um resumo curto e estruturado da fatia (claim, veredito, evidência, o que falta).
+- Encerre a fatia: sua ÚLTIMA ação DEVE ser `hx result <id> --verdict ... --note ...` (ou `hx release <id>` se nem começou). O resumo curto (claim, veredito, evidência, o que falta) vai na `--note`.

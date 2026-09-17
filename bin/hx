@@ -871,7 +871,7 @@ def probe_once(repo, scope, tag):
     max_wait = float(scope["rate"].get("max_wait_s", 30))
     rate_acquire(scope, repo, host, max_wait)
     status, headers, body = fetch(probe["method"], probe["url"], probe.get("headers"), None, cookies)
-    excerpt = re.sub(r"\s+", " ", body or "").strip()[:160]
+    excerpt = re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f]", " ", body or "")).strip()[:160]
     for sig in scope["health"]["rate_limited_if"]:
         if signal_matches(sig, status, headers, body):
             return False, "ratelimit", status, excerpt
