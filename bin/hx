@@ -632,7 +632,7 @@ def rate_effective_interval(scope, state, host):
     return max(floor, effective / (2 ** decay))
 
 
-def rate_acquire(scope, repo, host, max_wait):
+def rate_acquire(scope, repo, host, max_wait, burst=None):
     with flock(repo.hunt / ".lock.rate"):
         state = load_json(repo.rate, {})
         cooldown = (state.get("cooldowns") or {}).get(host)
@@ -642,15 +642,23 @@ def rate_acquire(scope, repo, host, max_wait):
         interval = rate_effective_interval(scope, state, host)
         global_interval = float(scope["rate"].get("global_interval_s", 0.5))
         t = now()
-        last = (state.get("hosts", {}).get(host, {}) or {}).get("last") or 0
+        host_entry = state.setdefault("hosts", {}).setdefault(host, {})
+        last = host_entry.get("last") or 0
         global_last = state.get("global") or 0
-        scheduled = max(t, last + interval, global_last + global_interval)
-        wait = scheduled - t
-        if wait > max_wait:
-            raise HxError(f"rate: esperaria {wait:.1f}s (max {max_wait}s)", EXIT_RATE)
-        if wait > 0:
-            sleep(wait)
-        state.setdefault("hosts", {}).setdefault(host, {})["last"] = scheduled
+        window = burst[1] if burst else 10
+        recent = [ts for ts in host_entry.get("recent", []) if ts > t - window]
+        if burst and len(recent) < burst[0]:
+            scheduled = t
+            wait = 0.0
+        else:
+            scheduled = max(t, last + interval, global_last + global_interval)
+            wait = scheduled - t
+            if wait > max_wait:
+                raise HxError(f"rate: esperaria {wait:.1f}s (max {max_wait}s)", EXIT_RATE)
+            if wait > 0:
+                sleep(wait)
+        host_entry["recent"] = (recent + [scheduled])[-10:]
+        host_entry["last"] = scheduled
         state["global"] = scheduled
         dump_json(repo.rate, state)
         return wait
@@ -1257,7 +1265,7 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 self.request.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
                 return
             try:
-                rate_acquire(scope, repo, host, float(scope["rate"].get("max_wait_s", 30)))
+                rate_acquire(scope, repo, host, float(scope["rate"].get("max_wait_s", 30)), burst=scope["rate"].get("burst"))
             except HxError as err:
                 audit(repo, "proxy", "CONNECT", host_port, "rate", str(err))
                 self.request.sendall(f"HTTP/1.1 429 Too Many Requests\r\nX-Hx: {err}\r\n\r\n".encode())

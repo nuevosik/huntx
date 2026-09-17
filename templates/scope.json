@@ -4,7 +4,7 @@
   "out_of_scope_hosts": [],
   "out_of_scope_paths": [],
   "allow_extra_hosts": [],
-  "rate": { "per_host_interval_s": 2, "global_interval_s": 0.5, "max_wait_s": 30, "adaptive": true, "step_up_max_s": 30, "decay_clean_min": 60 },
+  "rate": { "per_host_interval_s": 2, "global_interval_s": 0.5, "max_wait_s": 30, "adaptive": true, "step_up_max_s": 30, "decay_clean_min": 60, "burst": [6, 10] },
   "health": {
     "probes": [],
     "fresh_max_s": 600,
