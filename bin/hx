@@ -928,6 +928,19 @@ def apply_health_signals(repo, scope, host, status, headers, body):
             minutes = rate_waf_cooldown(scope, repo, host)
             audit(repo, "hx run", "health", host, "cooldown", f"{minutes}min")
             return
+    if jev_config(scope).get("enabled") and (status in (401, 403, 429, 503) or 300 <= status < 400):
+        excerpt = re.sub(r"\s+", " ", body or "").strip()[:160]
+        answers = jev_ask(repo, scope, "health", {"status": status, "url": f"https://{host}/", "excerpt": excerpt}, {
+            "health": {"type": "choice", "instructions": "A resposta do alvo e uma pagina de bloqueio/WAF, uma sessao invalida/login, ou normal?",
+                       "criteria": {"block": "Pagina de bloqueio, captcha ou WAF", "session_invalid": "Exige login ou sessao expirada", "normal": "Resposta normal da aplicacao"}},
+        }, jev_config(scope)["thresholds"]["health"])
+        answer = (answers or {}).get("health") or {}
+        choice = answer.get("choice")
+        probability = (answer.get("probabilities") or {}).get(choice, 0)
+        if choice == "block" and probability >= jev_config(scope)["thresholds"]["health"]:
+            rate_step_up(scope, repo, host, "jev-block")
+            minutes = rate_waf_cooldown(scope, repo, host)
+            audit(repo, "hx run", "health", host, "cooldown", f"{minutes}min jev")
 
 
 def health_load(repo):
@@ -983,6 +996,20 @@ def probe_once(repo, scope, tag):
     for sig in scope["health"]["session_invalid_if"]:
         if signal_matches(sig, status, headers, body):
             return False, "invalid", status, excerpt
+    if status in (401, 403, 429, 503) or 300 <= status < 400:
+        answers = jev_ask(repo, scope, "health", {"status": status, "url": probe["url"], "excerpt": excerpt}, {
+            "health": {"type": "choice", "instructions": "A resposta do alvo e uma pagina de bloqueio/WAF, uma sessao invalida/login, ou normal?",
+                       "criteria": {"block": "Pagina de bloqueio, captcha ou WAF", "session_invalid": "Exige login ou sessao expirada", "normal": "Resposta normal da aplicacao"}},
+        }, jev_config(scope)["thresholds"]["health"])
+        answer = (answers or {}).get("health") or {}
+        choice = answer.get("choice")
+        probability = (answer.get("probabilities") or {}).get(choice, 0)
+        if probability >= jev_config(scope)["thresholds"]["health"]:
+            if choice == "block":
+                rate_waf_cooldown(scope, repo, host)
+                return False, "waf", status, excerpt
+            if choice == "session_invalid":
+                return False, "invalid", status, excerpt
     return True, None, status, excerpt
 
 
