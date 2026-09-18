@@ -88,7 +88,7 @@ def claim_next(repo, owner, session=None):
         hyps, _ = hx.load_hyps(repo)
         ordered = sorted(
             (hyp for hyp in hyps if hyp["status"] == "open" and (not session or hyp.get("session_tag") in (None, session))),
-            key=lambda hyp: (1 if hyp.get("source") == "planner" else 0, -float(hyp.get("priority") or 0)),
+            key=lambda hyp: (1 if hyp.get("source") == "planner" else 0, -hx.priority_of(hyp)),
         )
         for hyp in ordered:
             hyp["status"] = "claimed"
@@ -519,6 +519,7 @@ def run_plan(ctx):
     session = parse_session_id(stdout)
     usage = export_usage(hx, session) if session else {}
     if hx.jev_config(repo.scope())["enabled"]:
+        updates = {}
         hyps, _ = hx.load_hyps(repo)
         for hyp in hyps:
             if hyp.get("status") != "open" or hyp.get("priority_ts"):
@@ -530,10 +531,17 @@ def run_plan(ctx):
                           "criteria": ["baixo", "medio", "alto"]}}, 0.0)
             if not answers:
                 break
-            hyp["priority"] = (answers.get("value") or {}).get("score", 0.0)
-            hyp["priority_ts"] = hx.now()
-        with hx.flock(repo.hunt / ".lock.hyps"):
-            hx.save_hyps(repo, hyps)
+            value = (answers.get("value") or {}).get("score")
+            if isinstance(value, (int, float)):
+                updates[hyp["id"]] = float(value)
+        if updates:
+            with hx.flock(repo.hunt / ".lock.hyps"):
+                current, _ = hx.load_hyps(repo)
+                for hyp in current:
+                    if hyp["id"] in updates and hyp.get("status") == "open" and not hyp.get("priority_ts"):
+                        hyp["priority"] = updates[hyp["id"]]
+                        hyp["priority_ts"] = hx.now()
+                hx.save_hyps(repo, current)
     record = {
         "ts": hx.now(),
         "mode": "plan",

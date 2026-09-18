@@ -185,15 +185,18 @@ def cmd_hypothesis_add(args):
         if candidates:
             answers = jev_ask(repo, scope, "dedup", {"claim": args.claim, "endpoint": args.endpoint, "class": args.cls}, {
                 "same": {"type": "choice", "instructions": "A nova hipotese e equivalente a alguma candidata?",
-                         "criteria": {**{hyp["id"]: f"{hyp['endpoint']} | {hyp['class']} | {hyp['status']} | {hyp['claim'][:80]}" for hyp in candidates}, "new": "Nao e equivalente a nenhuma"}},
+                         "criteria": {**{hyp["id"]: f"{hyp.get('endpoint', '')} | {hyp.get('class', '')} | {hyp.get('status', '')} | {hyp.get('claim', '')[:80]}" for hyp in candidates}, "new": "Nao e equivalente a nenhuma"}},
             }, jev_config(scope)["thresholds"]["dedup"])
             if answers:
-                answer = answers.get("same") or {}
+                answer = answers.get("same")
+                answer = answer if isinstance(answer, dict) else {}
                 chosen = answer.get("choice")
-                probability = (answer.get("probabilities") or {}).get(chosen, 0)
-                if chosen != "new" and probability >= jev_config(scope)["thresholds"]["dedup"] and not args.force:
-                    raise HxError(f"equivalente a {chosen} (p={probability:.2f}) — use --force para enfileirar", EXIT_GUARD)
-                duplicate_of = chosen if chosen != "new" else None
+                probabilities = answer.get("probabilities")
+                probability = probabilities.get(chosen, 0) if isinstance(probabilities, dict) else 0
+                if chosen != "new" and probability >= jev_config(scope)["thresholds"]["dedup"]:
+                    if not args.force:
+                        raise HxError(f"equivalente a {chosen} (p={probability:.2f}) — use --force para enfileirar", EXIT_GUARD)
+                    duplicate_of = chosen
     with flock(repo.hunt / ".lock.hyps"):
         hyps, _ = load_hyps(repo)
         hid = f"h{len(hyps) + 1:03d}"
@@ -207,7 +210,7 @@ def cmd_hypothesis_add(args):
             "confirm": args.confirm,
             "refute": args.refute,
             "evidence": args.evidence or f"scans/evidence/{hid}",
-            "duplicate_of": duplicate_of if args.force else None,
+            "duplicate_of": duplicate_of,
             "session_tag": args.session_tag,
             "owner": None,
             "created_ts": now(),
@@ -237,6 +240,13 @@ def cmd_hypothesis_drop(args):
     raise HxError(f"hipotese nao encontrada: {args.id}", EXIT_GUARD)
 
 
+def priority_of(hyp):
+    try:
+        return float(hyp.get("priority") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def cmd_next(args):
     repo = repo_from_cwd()
     owner = session_tag()
@@ -245,7 +255,7 @@ def cmd_next(args):
         hyps, _ = load_hyps(repo)
         ordered = sorted(
             (hyp for hyp in hyps if hyp["status"] == "open"),
-            key=lambda hyp: (1 if hyp.get("source") == "planner" else 0, -float(hyp.get("priority") or 0)),
+            key=lambda hyp: (1 if hyp.get("source") == "planner" else 0, -priority_of(hyp)),
         )
         for hyp in ordered:
             if len(picked) >= args.n:
@@ -429,18 +439,32 @@ JEV_DEFAULTS = {
 
 def jev_config(scope):
     config = json.loads(json.dumps(JEV_DEFAULTS))
-    provided = scope.get("jev") or {}
-    for key, value in provided.items():
-        if key == "thresholds" and isinstance(value, dict):
-            config["thresholds"].update(value)
-        else:
-            config[key] = value
+    provided = scope.get("jev")
+    if not isinstance(provided, dict):
+        return config
+    for key in ("enabled", "model"):
+        if key in provided:
+            config[key] = provided[key]
+    cap = provided.get("max_calls_per_run")
+    if cap is not None:
+        try:
+            config["max_calls_per_run"] = int(cap)
+        except (TypeError, ValueError):
+            pass
+    thresholds = provided.get("thresholds")
+    if isinstance(thresholds, dict):
+        for key, value in thresholds.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                config["thresholds"][key] = value
     return config
 
 
 def jev_budget_take(repo, scope):
     run_id = os.environ.get("HX_RUN_ID") or f"hour-{int(now() // 3600)}"
-    cap = int(jev_config(scope).get("max_calls_per_run") or 0)
+    try:
+        cap = int(jev_config(scope).get("max_calls_per_run") or 0)
+    except (TypeError, ValueError):
+        cap = int(JEV_DEFAULTS["max_calls_per_run"])
     with flock(repo.hunt / ".lock.jev"):
         state = load_json(repo.hunt / ".jev.json", {})
         if state.get("bucket") != run_id:
@@ -461,8 +485,9 @@ def jev_http(payload, key, timeout=10):
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         method="POST",
     )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as err:
         return err.code, {}
@@ -482,9 +507,9 @@ def jev_ask(repo, scope, use, state, questions, threshold):
         audit(repo, "jev", use, "-", "cap", f"teto de {config.get('max_calls_per_run')} chamadas")
         return None
     try:
-        redacted = json.loads(redact_body(json.dumps(state, ensure_ascii=False)))
+        redacted = redact_state(state)
     except Exception:
-        audit(repo, "jev", use, "-", "unavailable", "state nao serializavel")
+        audit(repo, "jev", use, "-", "unavailable", "state nao redativel")
         return None
     payload = {"state": redacted, "model": config.get("model") or "jev-latest", "questions": questions}
     result = jev_http(payload, key)
@@ -492,8 +517,11 @@ def jev_ask(repo, scope, use, state, questions, threshold):
         audit(repo, "jev", use, "-", "unavailable", f"http {result[0] if result else 'erro'}")
         return None
     answers = result[1].get("answers") or {}
+    if not isinstance(answers, dict):
+        audit(repo, "jev", use, "-", "unavailable", "answers invalido")
+        return None
     summary = json.dumps(answers, ensure_ascii=False)[:200]
-    audit(repo, "jev", use, f"thr {threshold}", "allow", summary)
+    audit(repo, "jev", use, f"thr {threshold}", "allow", f"thr {threshold} model {config.get('model')} | {summary}")
     return answers
 
 
@@ -860,6 +888,16 @@ def redact_body(text):
     return SENSITIVE_JSON_RE.sub(lambda m: m.group(1) + hash_or_drop(m.group(2)) + m.group(3), redacted)
 
 
+def redact_state(value):
+    if isinstance(value, str):
+        return redact_body(value)
+    if isinstance(value, dict):
+        return {key: redact_state(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_state(item) for item in value]
+    return value
+
+
 def extract_marker(pattern, text):
     if not pattern or not text:
         return None
@@ -951,9 +989,11 @@ def apply_health_signals(repo, scope, host, status, headers, body):
             "health": {"type": "choice", "instructions": "A resposta do alvo e uma pagina de bloqueio/WAF, uma sessao invalida/login, ou normal?",
                        "criteria": {"block": "Pagina de bloqueio, captcha ou WAF", "session_invalid": "Exige login ou sessao expirada", "normal": "Resposta normal da aplicacao"}},
         }, jev_config(scope)["thresholds"]["health"])
-        answer = (answers or {}).get("health") or {}
+        answer = (answers or {}).get("health")
+        answer = answer if isinstance(answer, dict) else {}
         choice = answer.get("choice")
-        probability = (answer.get("probabilities") or {}).get(choice, 0)
+        probabilities = answer.get("probabilities")
+        probability = probabilities.get(choice, 0) if isinstance(probabilities, dict) else 0
         if choice == "block" and probability >= jev_config(scope)["thresholds"]["health"]:
             rate_step_up(scope, repo, host, "jev-block")
             minutes = rate_waf_cooldown(scope, repo, host)
@@ -1018,9 +1058,11 @@ def probe_once(repo, scope, tag):
             "health": {"type": "choice", "instructions": "A resposta do alvo e uma pagina de bloqueio/WAF, uma sessao invalida/login, ou normal?",
                        "criteria": {"block": "Pagina de bloqueio, captcha ou WAF", "session_invalid": "Exige login ou sessao expirada", "normal": "Resposta normal da aplicacao"}},
         }, jev_config(scope)["thresholds"]["health"])
-        answer = (answers or {}).get("health") or {}
+        answer = (answers or {}).get("health")
+        answer = answer if isinstance(answer, dict) else {}
         choice = answer.get("choice")
-        probability = (answer.get("probabilities") or {}).get(choice, 0)
+        probabilities = answer.get("probabilities")
+        probability = probabilities.get(choice, 0) if isinstance(probabilities, dict) else 0
         if probability >= jev_config(scope)["thresholds"]["health"]:
             if choice == "block":
                 rate_waf_cooldown(scope, repo, host)
@@ -1381,12 +1423,13 @@ def cmd_verify(args):
         config = jev_config(scope)
         jev_meta = None
         if config.get("enabled"):
+            state_steps = {key: value for key, value in steps.items() if key != "hit"}
             answers = jev_ask(repo, scope, "verify", {
                 "claim": draft.get("title") or draft.get("claim") or draft["id"],
                 "scenario": scenario,
-                "steps": steps,
+                "steps": state_steps,
             }, {"sustains": {"type": "noul", "instructions": "A evidencia mecanica registrada sustenta a claim (nao e pagina de bloqueio, nao e reflexo coincidente)?",
-                             "criteria": {"true": "Evidencia coerente e especifica", "false": "Evidencia ambigua ou explica vel sem vulnerabilidade"}}},
+                             "criteria": {"true": "Evidencia coerente e especifica", "false": "Evidencia ambigua ou explicavel sem vulnerabilidade"}}},
                config["thresholds"]["verify_high"])
             if not answers:
                 draft["pass_requires_attest"] = True
@@ -1395,7 +1438,10 @@ def cmd_verify(args):
                 dump_json(draft_path, draft)
                 print(f"{draft['id']}: jev indisponivel — draft retido; assine com: hx verify {draft['id']} --attest")
                 return EXIT_OK
-            value = (answers.get("sustains") or {}).get("noul", 0.0)
+            answer = answers.get("sustains")
+            answer = answer if isinstance(answer, dict) else {}
+            value = answer.get("noul", 0.0)
+            value = float(value) if isinstance(value, (int, float)) else 0.0
             if value < config["thresholds"]["verify_low"]:
                 draft["pass_requires_attest"] = True
                 draft["proof"] = steps
