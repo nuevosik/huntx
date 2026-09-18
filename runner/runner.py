@@ -86,19 +86,16 @@ def runner_state_release_slice(repo):
 def claim_next(repo, owner, session=None):
     with hx.flock(repo.hunt / ".lock.hyps"):
         hyps, _ = hx.load_hyps(repo)
-        for planner in (False, True):
-            for hyp in hyps:
-                if hyp["status"] != "open":
-                    continue
-                if session and hyp.get("session_tag") not in (None, session):
-                    continue
-                if (hyp.get("source") == "planner") != planner:
-                    continue
-                hyp["status"] = "claimed"
-                hyp["owner"] = owner
-                hyp["claimed_ts"] = hx.now()
-                hx.save_hyps(repo, hyps)
-                return hyp
+        ordered = sorted(
+            (hyp for hyp in hyps if hyp["status"] == "open" and (not session or hyp.get("session_tag") in (None, session))),
+            key=lambda hyp: (1 if hyp.get("source") == "planner" else 0, -hx.priority_of(hyp)),
+        )
+        for hyp in ordered:
+            hyp["status"] = "claimed"
+            hyp["owner"] = owner
+            hyp["claimed_ts"] = hx.now()
+            hx.save_hyps(repo, hyps)
+            return hyp
     return None
 
 
@@ -521,6 +518,30 @@ def run_plan(ctx):
     rc, stdout, _, _ = retry_invoke(ctx, prompt)
     session = parse_session_id(stdout)
     usage = export_usage(hx, session) if session else {}
+    if hx.jev_config(repo.scope())["enabled"]:
+        updates = {}
+        hyps, _ = hx.load_hyps(repo)
+        for hyp in hyps:
+            if hyp.get("status") != "open" or hyp.get("priority_ts"):
+                continue
+            answers = hx.jev_ask(repo, repo.scope(), "priority", {
+                "target": (repo.hunt / "TARGET.md").read_text()[:600] if (repo.hunt / "TARGET.md").exists() else "",
+                "claim": hyp["claim"], "endpoint": hyp["endpoint"], "class": hyp["class"],
+            }, {"value": {"type": "score", "instructions": "Valor esperado desta hipotese como proxima work order (potencial de achado real vs custo de teste).",
+                          "criteria": ["baixo", "medio", "alto"]}}, 0.0)
+            if not answers:
+                break
+            value = (answers.get("value") or {}).get("score")
+            if isinstance(value, (int, float)):
+                updates[hyp["id"]] = float(value)
+        if updates:
+            with hx.flock(repo.hunt / ".lock.hyps"):
+                current, _ = hx.load_hyps(repo)
+                for hyp in current:
+                    if hyp["id"] in updates and hyp.get("status") == "open" and not hyp.get("priority_ts"):
+                        hyp["priority"] = updates[hyp["id"]]
+                        hyp["priority_ts"] = hx.now()
+                hx.save_hyps(repo, current)
     record = {
         "ts": hx.now(),
         "mode": "plan",
@@ -932,6 +953,7 @@ def runner_main(argv=None):
     os.environ["HX_ENGAGEMENT"] = str(repo.eng)
     owner = f"runner-{os.getpid()}"
     os.environ["HX_SESSION"] = owner
+    os.environ["HX_RUN_ID"] = f"runner-{repo.eng.name}-{int(hx.now())}"
     budget = {**DEFAULTS, "slices_max": args.slices, "wall_s": args.wall, "token_cap": args.max_tokens, "cost_cap": args.max_cost}
     hx.TTL_CLAIM_S = claim_ttl_for(budget)
     config = os.environ.get("RUNNER_CONFIG_CONTENT") or build_config_content(REPO_ROOT / "opencode" / "agents" / "hunt-auto.md", plan=args.plan)

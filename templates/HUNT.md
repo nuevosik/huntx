@@ -7,6 +7,7 @@
 - Refutação por auth-failure exige sessão viva (o `hx result` dispara o probe on-demand).
 - Achado só entra em FINDINGS/ via `hx verify` (cenário PASS) ou `hx verify --attest` (TTY, dj).
 - Evidência redigida na captura; segredos nunca em claro em disco.
+- Jev (opt-in, scope.json -> jev.enabled + TYPESAFE_API_KEY): health semantico, dedup no hypothesis add, prioridade da fila e segunda opiniao no verify; egress so de texto redigido; com Jev ligado e sem veredito, a promocao exige --attest.
 
 ## Início de sessão
 
