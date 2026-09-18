@@ -429,6 +429,28 @@ def coverage_counts(repo):
     return counts
 
 
+def parse_coverage_rows(repo):
+    try:
+        text = repo.coverage.read_text()
+    except OSError:
+        return [], True
+    rows = []
+    for line in text.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) < 5:
+            continue
+        if cells[0].lower() == "endpoint":
+            continue
+        if all(set(cell) <= set("-: ") for cell in cells):
+            continue
+        rows.append(cells[:5])
+    if not rows and text.strip():
+        return [], False
+    return rows, True
+
+
 JEV_DEFAULTS = {
     "enabled": True,
     "model": "jev-latest",
@@ -1630,6 +1652,21 @@ def render_ui(repo, show_findings=False, interval=15):
             f"<p class=\"sub\">lido em {fmt_ts(t)} — refresh {max(int(interval), 3)}s</p>",
             f"<div class=\"counts\">{pills}</div>",
             _ui_queue(hyps, t)]
+    try:
+        rows, cov_ok = parse_coverage_rows(repo)
+    except (OSError, UnicodeDecodeError):
+        rows, cov_ok = [], False
+    try:
+        counts_txt = " ".join(f"<span class=\"pill\">{_esc(k)}: <b>{v}</b></span>" for k, v in sorted(coverage_counts(repo).items()))
+    except (OSError, UnicodeDecodeError):
+        counts_txt = ""
+    if not rows:
+        cov_inner = "<p class=\"muted\">cobertura ilegível</p>" if not cov_ok else "<p class=\"muted\">sem dados</p>"
+    else:
+        trs = "".join("<tr>" + "".join(f"<td>{_esc(c)}</td>" for c in row) + "</tr>" for row in rows)
+        cov_inner = (f"<div class=\"counts\">{counts_txt}</div>" if counts_txt else "") + \
+            "<table><tr><th>endpoint</th><th>classe</th><th>status</th><th>evidência</th><th>nota</th></tr>" + trs + "</table>"
+    body.append(_section("Cobertura", cov_inner))
     page = ("<!doctype html><meta charset=utf8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
             f"<meta http-equiv=\"refresh\" content=\"{max(int(interval), 3)}\">"
             f"<title>hunt — {engagement}</title><style>{UI_CSS}</style>"
