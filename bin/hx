@@ -3,6 +3,7 @@ import argparse
 import fcntl
 import hashlib
 import html
+import http.server
 import json
 import os
 import re
@@ -1741,6 +1742,50 @@ def render_ui(repo, show_findings=False, interval=15):
     return page
 
 
+def clamp_interval(value):
+    return max(int(value), 3)
+
+
+class _UiHandler(http.server.BaseHTTPRequestHandler):
+    repo = None
+    show_findings = False
+    interval = 15
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if self.path != "/":
+            self.send_error(404)
+            return
+        body = render_ui(type(self).repo, show_findings=type(self).show_findings, interval=type(self).interval)
+        data = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def cmd_ui(args):
+    eng = Path(args.dir).resolve()
+    if not (eng / "hunt" / "scope.json").exists():
+        raise HxError("engagement nao encontrado (hunt/scope.json)", EXIT_GUARD)
+    repo = Repo(eng)
+    _UiHandler.repo = repo
+    _UiHandler.show_findings = args.show_findings
+    _UiHandler.interval = clamp_interval(args.interval)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), _UiHandler)
+    print(f"hunt panel: http://127.0.0.1:{srv.server_port}/")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    return EXIT_OK
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="hx")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1808,6 +1853,12 @@ def main(argv=None):
     verify_p = sub.add_parser("verify")
     verify_p.add_argument("id")
     verify_p.add_argument("--attest", action="store_true")
+    ui_p = sub.add_parser("ui")
+    ui_p.add_argument("--serve", action="store_true", required=True)
+    ui_p.add_argument("--port", type=int, default=8137)
+    ui_p.add_argument("--dir", default=".")
+    ui_p.add_argument("--interval", type=int, default=15)
+    ui_p.add_argument("--show-findings", dest="show_findings", action="store_true")
     proxy_p = sub.add_parser("proxy")
     proxy_p.add_argument("--port", type=int, default=8899)
     args = parser.parse_args(argv)
@@ -1839,6 +1890,8 @@ def main(argv=None):
             return cmd_run(args)
         elif args.cmd == "verify":
             return cmd_verify(args)
+        elif args.cmd == "ui":
+            return cmd_ui(args)
         elif args.cmd == "proxy":
             return cmd_proxy(args)
         elif args.cmd == "rate":
