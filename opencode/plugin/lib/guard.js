@@ -69,10 +69,11 @@ export function decideBash(scope, command) {
   if (!command) return { action: "allow", reason: "" };
   const trimmed = command.trim();
   const segments = trimmed.split(/[;\n&|]/).map((segment) => segment.trim()).filter(Boolean);
-  if (segments.length > 0 && segments.every((segment) => segment === "hx" || segment.startsWith("hx "))) {
-    if (SUBSTITUTION_RE.test(trimmed)) {
-      return { action: "block", reason: "substituicao de comando nos argumentos do hx — proibido" };
-    }
+  const hxSegments = segments.filter((segment) => segment === "hx" || segment.startsWith("hx "));
+  if (hxSegments.length > 0 && SUBSTITUTION_RE.test(trimmed)) {
+    return { action: "block", reason: "substituicao de comando nos argumentos do hx — proibido" };
+  }
+  if (segments.length > 0 && hxSegments.length === segments.length) {
     return { action: "allow", reason: "hx path" };
   }
   const offenders = new Set();
