@@ -1361,9 +1361,37 @@ def cmd_verify(args):
             print(f"{draft['id']}: PASS fraco (marker curto '{steps['victim']['marker']}') — assine com: hx verify {draft['id']} --attest")
         return EXIT_OK
     if passed:
+        config = jev_config(scope)
+        jev_meta = None
+        if config.get("enabled"):
+            answers = jev_ask(repo, scope, "verify", {
+                "claim": draft.get("title") or draft.get("claim") or draft["id"],
+                "scenario": scenario,
+                "steps": steps,
+            }, {"sustains": {"type": "noul", "instructions": "A evidencia mecanica registrada sustenta a claim (nao e pagina de bloqueio, nao e reflexo coincidente)?",
+                             "criteria": {"true": "Evidencia coerente e especifica", "false": "Evidencia ambigua ou explica vel sem vulnerabilidade"}}},
+               config["thresholds"]["verify_high"])
+            if not answers:
+                draft["pass_requires_attest"] = True
+                draft["proof"] = steps
+                draft["jev"] = {"unavailable": True}
+                dump_json(draft_path, draft)
+                print(f"{draft['id']}: jev indisponivel — draft retido; assine com: hx verify {draft['id']} --attest")
+                return EXIT_OK
+            value = (answers.get("sustains") or {}).get("noul", 0.0)
+            if value < config["thresholds"]["verify_low"]:
+                draft["pass_requires_attest"] = True
+                draft["proof"] = steps
+                draft["jev"] = {"noul": value, "fail": True}
+                dump_json(draft_path, draft)
+                print(f"{draft['id']}: jev reprovou ({value:.2f}) — draft retido; assine com: hx verify {draft['id']} --attest")
+                return EXIT_OK
+            jev_meta = {"noul": value, "weak": value < config["thresholds"]["verify_high"]}
         strip_fail_meta(draft)
         draft["verified_at"] = now()
         draft["proof"] = steps
+        if jev_meta:
+            draft["jev"] = jev_meta
         dump_json(repo.hunt / "FINDINGS" / f"{draft['id']}.json", draft)
         draft_path.unlink()
         print(f"{draft['id']}: PASS — {json.dumps(steps, ensure_ascii=False)}")
