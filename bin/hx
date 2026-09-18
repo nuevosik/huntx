@@ -243,19 +243,18 @@ def cmd_next(args):
     picked = []
     with flock(repo.hunt / ".lock.hyps"):
         hyps, _ = load_hyps(repo)
-        for planner in (False, True):
-            for hyp in hyps:
-                if len(picked) >= args.n:
-                    break
-                if hyp["status"] != "open":
-                    continue
-                if (hyp.get("source") == "planner") != planner:
-                    continue
-                if not args.peek:
-                    hyp["status"] = "claimed"
-                    hyp["owner"] = owner
-                    hyp["claimed_ts"] = now()
-                picked.append(hyp)
+        ordered = sorted(
+            (hyp for hyp in hyps if hyp["status"] == "open"),
+            key=lambda hyp: (1 if hyp.get("source") == "planner" else 0, -float(hyp.get("priority") or 0)),
+        )
+        for hyp in ordered:
+            if len(picked) >= args.n:
+                break
+            if not args.peek:
+                hyp["status"] = "claimed"
+                hyp["owner"] = owner
+                hyp["claimed_ts"] = now()
+            picked.append(hyp)
         save_hyps(repo, hyps)
     for hyp in picked:
         label = f"[{hyp['id']}]" + (" [planner]" if hyp.get("source") == "planner" else "")
