@@ -1542,6 +1542,101 @@ def cmd_proxy(args):
         pass
 
 
+def fmt_age(secs):
+    secs = max(0, int(secs or 0))
+    if secs < 3600:
+        return f"{secs // 60}min"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
+
+
+def fmt_ts(ts):
+    return time.strftime("%d/%m %H:%M", time.localtime(ts or 0))
+
+
+UI_CSS = """:root{--background:oklch(0.15 0.003 160);--foreground:oklch(0.92 0.01 160);--card:oklch(0.18 0.003 160);--card-foreground:oklch(0.92 0.01 160);--primary:oklch(0.78 0.21 148);--primary-foreground:oklch(0.16 0.02 148);--muted:oklch(0.21 0.003 160);--muted-foreground:oklch(0.62 0.01 160);--destructive:oklch(0.6 0.23 27);--warning:oklch(0.78 0.16 75);--info:oklch(0.7 0.13 235);--border:oklch(0.29 0.004 160);--radius:0.25rem}
+body{margin:0;background:var(--background);color:var(--foreground);font-family:"Space Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.01em}
+.wrap{max-width:56rem;margin:0 auto;padding:1.5rem}
+h1{font-size:1.25rem;margin:0 0 .25rem}h2{font-size:1rem;margin:2rem 0 .5rem;color:var(--foreground)}
+.sub{color:var(--muted-foreground);font-size:.8rem;margin:0 0 1rem}
+.counts{display:flex;gap:.5rem;flex-wrap:wrap;margin:.75rem 0}
+.pill{border:1px solid var(--border);border-radius:var(--radius);padding:.15rem .6rem;font-size:.8rem}
+.pill b{color:var(--primary)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:.6rem .8rem;margin:.4rem 0}
+.muted{color:var(--muted-foreground);font-size:.8rem}
+table{border-collapse:collapse;width:100%;font-size:.8rem}
+th,td{text-align:left;padding:.3rem .5rem;border-bottom:1px solid var(--border)}
+th{color:var(--muted-foreground);font-weight:400}
+.chip{display:inline-block;border:1px solid var(--border);border-radius:var(--radius);padding:0 .45rem;font-size:.75rem}
+.stale{color:var(--warning)}"""
+
+
+def _esc(value):
+    return html.escape("" if value is None else str(value))
+
+
+def _section(title, inner):
+    return f"<h2>{_esc(title)}</h2>\n{inner}"
+
+
+def _ui_queue(hyps, t):
+    groups = {"open": [], "claimed": [], "running": [], "result": []}
+    for hyp in hyps:
+        if hyp.get("status") in groups:
+            groups[hyp.get("status")].append(hyp)
+    parts = []
+    for status in ("open", "claimed", "running", "result"):
+        items = groups[status]
+        parts.append(f"<h2>Fila — {_esc(status)} ({len(items)})</h2>")
+        if not items:
+            parts.append('<p class="muted">sem dados</p>')
+            continue
+        for hyp in items:
+            label = f"[{_esc(hyp.get('id'))}]" + (" [planner]" if hyp.get("source") == "planner" else "")
+            lines = [f"<div class=\"card\"><div><b>{label}</b> {_esc(hyp.get('claim'))}</div>",
+                     f"<div class=\"muted\">{_esc(hyp.get('endpoint'))} | {_esc(hyp.get('class'))}</div>"]
+            if status == "open":
+                lines.append(f"<div class=\"muted\">confirm: {_esc(hyp.get('confirm'))} — refute: {_esc(hyp.get('refute'))}</div>")
+            if status in ("claimed", "running"):
+                age = t - (hyp.get("claimed_ts") or t)
+                stale = (hyp.get("claimed_ts") or 0) + TTL_CLAIM_S < t
+                extra = ' <span class="stale">claim expirado</span>' if stale else ""
+                lines.append(f"<div class=\"muted\">owner: {_esc(hyp.get('owner'))} — há {fmt_age(age)}{extra}</div>")
+            if status == "result":
+                result = hyp.get("result") or {}
+                lines.append(f"<div class=\"muted\">verdict: {_esc(result.get('verdict'))} — {_esc(result.get('note'))}</div>")
+            lines.append("</div>")
+            parts.append("\n".join(lines))
+    return "\n".join(parts)
+
+
+def render_ui(repo, show_findings=False, interval=15):
+    t = now()
+    try:
+        hyps, _ = load_hyps(repo)
+    except (OSError, json.JSONDecodeError):
+        hyps = []
+    counts = {"open": 0, "claimed": 0, "running": 0, "result": 0, "dropped": 0}
+    for hyp in hyps:
+        if hyp.get("status") in counts:
+            counts[hyp.get("status")] += 1
+    try:
+        engagement = _esc(repo.scope().get("engagement") or repo.eng.name)
+    except (OSError, json.JSONDecodeError):
+        engagement = _esc(repo.eng.name)
+    pills = " ".join(f"<span class=\"pill\">{name}: <b>{counts[name]}</b></span>" for name in ("open", "claimed", "running", "result", "dropped"))
+    body = [f"<h1>hunt — {engagement}</h1>",
+            f"<p class=\"sub\">lido em {fmt_ts(t)} — refresh {max(int(interval), 3)}s</p>",
+            f"<div class=\"counts\">{pills}</div>",
+            _ui_queue(hyps, t)]
+    page = ("<!doctype html><meta charset=utf8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+            f"<meta http-equiv=\"refresh\" content=\"{max(int(interval), 3)}\">"
+            f"<title>hunt — {engagement}</title><style>{UI_CSS}</style>"
+            f"<div class=\"wrap\">" + "\n".join(body) + "</div>")
+    return page
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="hx")
     sub = parser.add_subparsers(dest="cmd", required=True)
