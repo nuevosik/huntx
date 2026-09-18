@@ -177,6 +177,23 @@ def cmd_hypothesis_add(args):
         raise HxError("--session-tag exige probes no scope (health.probes) para validar", EXIT_GUARD)
     if args.session_tag and args.session_tag not in probe_tags:
         raise HxError(f"session-tag '{args.session_tag}' nao bate com os probes ({', '.join(probe_tags)})", EXIT_GUARD)
+    duplicate_of = None
+    if jev_config(scope)["enabled"]:
+        hyps, _ = load_hyps(repo)
+        candidates = [hyp for hyp in hyps if hyp.get("status") in ("open", "claimed") or (hyp.get("status") == "result" and (hyp.get("result") or {}).get("verdict") == "refuted")]
+        candidates = candidates[:20]
+        if candidates:
+            answers = jev_ask(repo, scope, "dedup", {"claim": args.claim, "endpoint": args.endpoint, "class": args.cls}, {
+                "same": {"type": "choice", "instructions": "A nova hipotese e equivalente a alguma candidata?",
+                         "criteria": {**{hyp["id"]: f"{hyp['endpoint']} | {hyp['class']} | {hyp['status']} | {hyp['claim'][:80]}" for hyp in candidates}, "new": "Nao e equivalente a nenhuma"}},
+            }, jev_config(scope)["thresholds"]["dedup"])
+            if answers:
+                answer = answers.get("same") or {}
+                chosen = answer.get("choice")
+                probability = (answer.get("probabilities") or {}).get(chosen, 0)
+                if chosen != "new" and probability >= jev_config(scope)["thresholds"]["dedup"] and not args.force:
+                    raise HxError(f"equivalente a {chosen} (p={probability:.2f}) — use --force para enfileirar", EXIT_GUARD)
+                duplicate_of = chosen if chosen != "new" else None
     with flock(repo.hunt / ".lock.hyps"):
         hyps, _ = load_hyps(repo)
         hid = f"h{len(hyps) + 1:03d}"
@@ -190,6 +207,7 @@ def cmd_hypothesis_add(args):
             "confirm": args.confirm,
             "refute": args.refute,
             "evidence": args.evidence or f"scans/evidence/{hid}",
+            "duplicate_of": duplicate_of if args.force else None,
             "session_tag": args.session_tag,
             "owner": None,
             "created_ts": now(),
@@ -1495,6 +1513,7 @@ def main(argv=None):
     add_p.add_argument("--evidence")
     add_p.add_argument("--session-tag", dest="session_tag")
     add_p.add_argument("--source")
+    add_p.add_argument("--force", action="store_true")
     drop_p = hyp_sub.add_parser("drop")
     drop_p.add_argument("id")
     drop_p.add_argument("--force", action="store_true")
