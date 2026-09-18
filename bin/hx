@@ -430,7 +430,7 @@ def coverage_counts(repo):
 
 
 JEV_DEFAULTS = {
-    "enabled": False,
+    "enabled": True,
     "model": "jev-latest",
     "max_calls_per_run": 50,
     "thresholds": {"health": 0.8, "dedup": 0.85, "verify_high": 0.8, "verify_low": 0.5},

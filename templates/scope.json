@@ -13,7 +13,7 @@
     "waf_block_if": ["body_contains:_px", "body_contains:px-captcha"],
     "rate_limited_if": ["status:429", "status:503"]
   },
-  "jev": { "enabled": false, "model": "jev-latest", "max_calls_per_run": 50,
+  "jev": { "enabled": true, "model": "jev-latest", "max_calls_per_run": 50,
            "thresholds": { "health": 0.8, "dedup": 0.85, "verify_high": 0.8, "verify_low": 0.5 } },
   "allowed_mutations": [],
   "evidence_dir": "scans/evidence"
