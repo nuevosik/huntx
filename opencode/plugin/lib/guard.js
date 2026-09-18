@@ -68,7 +68,7 @@ export function extractHosts(command) {
 export function decideBash(scope, command) {
   if (!command) return { action: "allow", reason: "" };
   const trimmed = command.trim();
-  const segments = trimmed.split(/[;\n]|&&|\|\|?/).map((segment) => segment.trim()).filter(Boolean);
+  const segments = trimmed.split(/[;\n&|]/).map((segment) => segment.trim()).filter(Boolean);
   if (segments.length > 0 && segments.every((segment) => segment === "hx" || segment.startsWith("hx "))) {
     if (SUBSTITUTION_RE.test(trimmed)) {
       return { action: "block", reason: "substituicao de comando nos argumentos do hx — proibido" };
