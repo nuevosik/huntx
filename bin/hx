@@ -12,6 +12,8 @@ import socket
 import socketserver
 import sys
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse, quote
@@ -398,6 +400,100 @@ def coverage_counts(repo):
                 if len(cells) >= 3:
                     counts[cells[2]] = counts.get(cells[2], 0) + 1
     return counts
+
+
+JEV_DEFAULTS = {
+    "enabled": False,
+    "model": "jev-latest",
+    "max_calls_per_run": 50,
+    "thresholds": {"health": 0.8, "dedup": 0.85, "verify_high": 0.8, "verify_low": 0.5},
+}
+
+
+def jev_config(scope):
+    config = json.loads(json.dumps(JEV_DEFAULTS))
+    provided = scope.get("jev") or {}
+    for key, value in provided.items():
+        if key == "thresholds" and isinstance(value, dict):
+            config["thresholds"].update(value)
+        else:
+            config[key] = value
+    return config
+
+
+def jev_budget_take(repo, scope):
+    run_id = os.environ.get("HX_RUN_ID") or f"hour-{int(now() // 3600)}"
+    cap = int(jev_config(scope).get("max_calls_per_run") or 0)
+    with flock(repo.hunt / ".lock.jev"):
+        state = load_json(repo.hunt / ".jev.json", {})
+        if state.get("bucket") != run_id:
+            state = {"bucket": run_id, "calls": 0}
+        if cap and state.get("calls", 0) >= cap:
+            dump_json(repo.hunt / ".jev.json", state)
+            return False
+        state["calls"] = state.get("calls", 0) + 1
+        dump_json(repo.hunt / ".jev.json", state)
+        return True
+
+
+def jev_http(payload, key, timeout=10):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.typesafe.ai/v1/systemone",
+        data=body,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        return err.code, {}
+    except Exception:
+        return None
+
+
+def jev_ask(repo, scope, use, state, questions, threshold):
+    config = jev_config(scope)
+    if not config.get("enabled"):
+        return None
+    key = os.environ.get("TYPESAFE_API_KEY")
+    if not key:
+        audit(repo, "jev", use, "-", "unavailable", "sem TYPESAFE_API_KEY")
+        return None
+    if not jev_budget_take(repo, scope):
+        audit(repo, "jev", use, "-", "cap", f"teto de {config.get('max_calls_per_run')} chamadas")
+        return None
+    try:
+        redacted = json.loads(redact_body(json.dumps(state, ensure_ascii=False)))
+    except Exception:
+        audit(repo, "jev", use, "-", "unavailable", "state nao serializavel")
+        return None
+    payload = {"state": redacted, "model": config.get("model") or "jev-latest", "questions": questions}
+    result = jev_http(payload, key)
+    if not result or result[0] != 200 or not isinstance(result[1], dict):
+        audit(repo, "jev", use, "-", "unavailable", f"http {result[0] if result else 'erro'}")
+        return None
+    answers = result[1].get("answers") or {}
+    summary = json.dumps(answers, ensure_ascii=False)[:200]
+    audit(repo, "jev", use, f"thr {threshold}", "allow", summary)
+    return answers
+
+
+def cmd_jev_status(args):
+    repo = repo_from_cwd()
+    scope = repo.scope()
+    config = jev_config(scope)
+    key = "presente" if os.environ.get("TYPESAFE_API_KEY") else "ausente"
+    state = load_json(repo.hunt / ".jev.json", {})
+    print(f"jev: {'ligado' if config.get('enabled') else 'desligado'} | key: {key} | modelo: {config.get('model')}")
+    print(f"thresholds: {json.dumps(config.get('thresholds'), ensure_ascii=False)} | teto: {config.get('max_calls_per_run')}")
+    print(f"budget: {state.get('bucket', '-')} -> {state.get('calls', 0)} chamadas")
+    audit_path = repo.hunt / "audit.log"
+    lines = [line for line in audit_path.read_text().splitlines() if '"jev"' in line][-10:] if audit_path.exists() else []
+    for line in lines:
+        print(line)
+    return EXIT_OK
 
 
 def cmd_brief(args):
@@ -1361,6 +1457,10 @@ def main(argv=None):
     res_p.add_argument("--force", action="store_true")
     brief_p = sub.add_parser("brief")
     brief_p.add_argument("--max-bytes", dest="max_bytes", type=int, default=4000)
+    jev_p = sub.add_parser("jev")
+    jev_sub = jev_p.add_subparsers(dest="jev_cmd", required=True)
+    jev_status = jev_sub.add_parser("status")
+    jev_status.set_defaults(func=cmd_jev_status)
     sub.add_parser("debrief")
     pending_p = sub.add_parser("pending")
     pending_sub = pending_p.add_subparsers(dest="pending_cmd", required=True)
@@ -1409,6 +1509,8 @@ def main(argv=None):
             cmd_result(args)
         elif args.cmd == "brief":
             cmd_brief(args)
+        elif args.cmd == "jev":
+            return args.func(args)
         elif args.cmd == "debrief":
             cmd_debrief(args)
         elif args.cmd == "pending":
