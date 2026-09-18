@@ -62,6 +62,9 @@ hx debrief   # CLI twin of /debrief (deterministic, no LLM)
 
 Deterministic, no LLM: writes `hunt/sessions/YYYY-MM-DD-NN.md` from `runs.jsonl`, `HYPOTHESES.json`, `COVERAGE.md` and the existing session files (numbering + cutoff) — runs/tokens/cost per hypothesis, verdicts, coverage counts, queue, and observation notes (timeouts, reconciliations) since the last debrief.
 
+## Jev (opt-in)
+`scope.json → jev.enabled` + `TYPESAFE_API_KEY` no env. Quatro usos: health semântico (`choice`), dedup no `hypothesis add`, prioridade da fila no planner (`score`) e segunda opinião no `hx verify` (`noul`, fail-closed: sem veredito, promoção exige `--attest`). Egress só de texto redigido (excerpt ≤160, claim/endpoint, contadores); teto `max_calls_per_run` em `hunt/.jev.json`; `hx jev status` mostra config/budget/últimas decisões.
+
 ## Scope
 
 Not a sandbox. The tripwire blocks convenient paths, the guard is the only network exit for scripted traffic, and the proxy covers clients that honor `HTTP(S)_PROXY` — none of it replaces authorization and program rules. Authorized scope only.

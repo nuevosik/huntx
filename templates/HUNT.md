@@ -7,6 +7,7 @@
 - Refutação por auth-failure exige sessão viva (o `hx result` dispara o probe on-demand).
 - Achado só entra em FINDINGS/ via `hx verify` (cenário PASS) ou `hx verify --attest` (TTY, dj).
 - Evidência redigida na captura; segredos nunca em claro em disco.
+- Jev (opt-in): ... egress redigido; D é fail-closed (attest humano sem Jev).
 
 ## Início de sessão
 
