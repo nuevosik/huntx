@@ -1633,6 +1633,43 @@ def _ui_queue(hyps, t):
     return "\n".join(parts)
 
 
+def ui_findings(repo):
+    out = []
+    try:
+        paths = sorted((repo.hunt / "FINDINGS").glob("*.json"))
+    except OSError:
+        return out
+    for path in paths:
+        try:
+            data = load_json(path, {})
+        except json.JSONDecodeError:
+            continue
+        verified, _ = finding_verified(repo, path.stem)
+        if not verified or not isinstance(data, dict):
+            continue
+        out.append({"id": path.stem,
+                    "verdict": data.get("verdict"),
+                    "note": data.get("note"),
+                    "evidence": data.get("evidence") or data.get("proof_ref")})
+    return out
+
+
+def ui_runs(repo):
+    try:
+        records = read_runs(repo.hunt / "runs.jsonl", 0)
+    except (OSError, UnicodeDecodeError):
+        return []
+    return records[-10:]
+
+
+def ui_sessions(repo):
+    try:
+        names = sorted(path.name for path in (repo.hunt / "sessions").glob("*.md"))
+    except OSError:
+        return []
+    return names[-5:]
+
+
 def render_ui(repo, show_findings=False, interval=15):
     t = now()
     try:
@@ -1667,6 +1704,36 @@ def render_ui(repo, show_findings=False, interval=15):
         cov_inner = (f"<div class=\"counts\">{counts_txt}</div>" if counts_txt else "") + \
             "<table><tr><th>endpoint</th><th>classe</th><th>status</th><th>evidência</th><th>nota</th></tr>" + trs + "</table>"
     body.append(_section("Cobertura", cov_inner))
+    if show_findings:
+        try:
+            findings = ui_findings(repo)
+        except (OSError, json.JSONDecodeError):
+            findings = None
+        if findings is None:
+            f_inner = "<p class=\"muted\">sem dados</p>"
+        elif not findings:
+            f_inner = "<p class=\"muted\">nenhum finding verificado</p>"
+        else:
+            cards = "".join(
+                f"<div class=\"card\"><div><b>[{_esc(f['id'])}]</b> {_esc(f['verdict'])}</div>"
+                f"<div class=\"muted\">{_esc(f['note'])} — evidência: {_esc(f['evidence'])}</div></div>"
+                for f in findings)
+            f_inner = cards
+        body.append(_section("Findings verificados", f_inner))
+    runs = ui_runs(repo)
+    if not runs:
+        r_inner = "<p class=\"muted\">sem dados</p>"
+    else:
+        trs = "".join(
+            f"<tr><td>{_esc(fmt_ts(r.get('ts')))}</td><td>{_esc(r.get('hyp') or r.get('mode') or '-')}</td>"
+            f"<td>{_esc(r.get('tokens'))}</td><td>{_esc(fmt_money(r.get('cost') or 0.0))}</td></tr>"
+            for r in runs)
+        r_inner = "<table><tr><th>hora</th><th>hipótese</th><th>tokens</th><th>custo</th></tr>" + trs + "</table>"
+    body.append(_section("Runs recentes", r_inner))
+    sessions = ui_sessions(repo)
+    s_inner = "<p class=\"muted\">sem dados</p>" if not sessions else \
+        "<div class=\"muted\">" + "<br>".join(_esc(n) for n in sessions) + "</div>"
+    body.append(_section("Sessões", s_inner))
     page = ("<!doctype html><meta charset=utf8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
             f"<meta http-equiv=\"refresh\" content=\"{max(int(interval), 3)}\">"
             f"<title>hunt — {engagement}</title><style>{UI_CSS}</style>"
