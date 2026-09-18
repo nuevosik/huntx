@@ -62,9 +62,9 @@ hx debrief   # CLI twin of /debrief (deterministic, no LLM)
 
 Deterministic, no LLM: writes `hunt/sessions/YYYY-MM-DD-NN.md` from `runs.jsonl`, `HYPOTHESES.json`, `COVERAGE.md` and the existing session files (numbering + cutoff) — runs/tokens/cost per hypothesis, verdicts, coverage counts, queue, and observation notes (timeouts, reconciliations) since the last debrief.
 
-## Jev (opt-in)
+## Jev (ligado por padrão)
 
-`scope.json → jev.enabled` + `TYPESAFE_API_KEY` no env. Quatro usos: health semântico (`choice`), dedup no `hypothesis add`, prioridade da fila no planner (`score`) e segunda opinião no `hx verify` (`noul`, fail-closed: sem veredito, promoção exige `--attest`). Egress só de texto redigido: health manda excerpt ≤160; dedup manda endpoint/classe/claim[:80]; prioridade manda excerpt do TARGET ≤600; verify manda claim/cenário/steps (statuses, marcadores e flags; nunca corpos). O teto `max_calls_per_run` é configurado no `scope.json`; `hunt/.jev.json` guarda bucket/uso; `hx jev status` mostra config/budget/últimas decisões.
+Ligado por padrão em todo engagement; desligue com `scope.json → "jev": {"enabled": false}`. Requer `TYPESAFE_API_KEY` no ambiente (sem key/via API fora, A/B/C degradam e D retém para `--attest`). Quatro usos: health semântico (`choice`), dedup no `hypothesis add`, prioridade da fila no planner (`score`) e segunda opinião no `hx verify` (`noul`, fail-closed: sem veredito, promoção exige `--attest`). Egress só de texto redigido: health manda excerpt ≤160; dedup manda endpoint/classe/claim[:80]; prioridade manda excerpt do TARGET ≤600; verify manda claim/cenário/steps (statuses, marcadores e flags; nunca corpos). O teto `max_calls_per_run` é configurado no `scope.json`; `hunt/.jev.json` guarda bucket/uso; `hx jev status` mostra config/budget/últimas decisões.
 
 ## Scope
 
