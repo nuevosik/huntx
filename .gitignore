@@ -2,6 +2,3 @@ __pycache__/
 *.pyc
 .superpowers/
 .worktrees/
-specs/
-plans/
-tests/
