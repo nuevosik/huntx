@@ -50,6 +50,25 @@ class HxError(Exception):
         self.code = code
 
 
+ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def safe_id(value, what="id"):
+    text = str(value or "")
+    if not ID_RE.fullmatch(text) or ".." in text:
+        raise HxError(f"{what} invalido: {value!r}", EXIT_GUARD)
+    return text
+
+
+def eng_path(repo, value, what):
+    anchor = repo.eng.resolve()
+    path = Path(value)
+    target = path.resolve() if path.is_absolute() else (anchor / path).resolve()
+    if target != anchor and anchor not in target.parents:
+        raise HxError(f"{what} fora do engagement: {value} — use caminho dentro do eng", EXIT_GUARD)
+    return target
+
+
 def atomic_write(path, text):
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
@@ -141,6 +160,10 @@ def cmd_init(args):
     if protocol.exists():
         atomic_write(eng / "HUNT.md", protocol.read_text())
     atomic_write(hunt / ".gitignore", "scans/\nsessions/\n.health.json\n.ratelimit.json\n.runnerstate.json\n.jev.json\npending/\naudit.log\nrunner.pid\nrunner.stop\nruns.jsonl\n.lock.*\n")
+    eng_ignore = eng / ".gitignore"
+    existing_ignore = eng_ignore.read_text() if eng_ignore.exists() else ""
+    if "recon/session_" not in existing_ignore:
+        atomic_write(eng_ignore, (existing_ignore.rstrip("\n") + "\n" if existing_ignore.strip() else "") + "recon/session_*.json\n")
     print(f"engagement inicializado: {hunt}")
 
 
@@ -151,12 +174,23 @@ def session_tag():
     return os.environ.get("HX_SESSION") or f"pid-{os.getpid()}"
 
 
+def claim_ttl():
+    raw = os.environ.get("HX_CLAIM_TTL_S")
+    if raw:
+        try:
+            return max(TTL_CLAIM_S, float(raw))
+        except ValueError:
+            pass
+    return TTL_CLAIM_S
+
+
 def load_hyps(repo):
     hyps = load_json(repo.hyps, [])
     t = now()
+    ttl = claim_ttl()
     changed = False
     for hyp in hyps:
-        if hyp.get("status") in ("claimed", "running") and (hyp.get("claimed_ts") or 0) + TTL_CLAIM_S < t:
+        if hyp.get("status") in ("claimed", "running") and (hyp.get("claimed_ts") or 0) + ttl < t:
             hyp["status"] = "open"
             hyp["owner"] = None
             hyp["claimed_ts"] = None
@@ -307,7 +341,11 @@ def update_coverage(repo, endpoint, cls, status, evidence, note):
         lines = path.read_text().splitlines()
         header = "| endpoint | classe | status | evidência | nota |"
         sep = "|---|---|---|---|---|"
-        row = f"| {endpoint} | {cls} | {status} | {evidence} | {note} |"
+
+        def clean(value):
+            return " ".join(str(value).split()).replace("|", "\\|")
+
+        row = f"| {clean(endpoint)} | {clean(cls)} | {clean(status)} | {clean(evidence)} | {clean(note)} |"
         replaced = False
         for i, line in enumerate(lines):
             if not line.startswith("|"):
@@ -375,9 +413,7 @@ AUTH_FAIL_STATUSES = {401, 403}
 def evidence_auth_failure(repo, hyp):
     if not hyp.get("evidence"):
         return False
-    evidence_dir = Path(hyp["evidence"])
-    if not evidence_dir.is_absolute():
-        evidence_dir = repo.eng / evidence_dir
+    evidence_dir = eng_path(repo, hyp["evidence"], "evidencia")
     if not evidence_dir.exists():
         return False
     files = sorted(evidence_dir.glob("*.json"), key=lambda path: path.stat().st_mtime)
@@ -733,15 +769,18 @@ def cmd_pending(args):
             record = load_json(path, {})
             print(f"{record.get('id')} {record.get('method')} {record.get('url')}")
     elif args.pending_cmd == "show":
+        safe_id(args.id, "id do pending")
         record = load_json(repo.hunt / "pending" / f"{args.id}.json", None)
         if record is None:
             raise HxError(f"pending nao encontrado: {args.id}", EXIT_GUARD)
         print(json.dumps(record, indent=1, ensure_ascii=False))
     elif args.pending_cmd == "run":
+        safe_id(args.id, "id do pending")
         cmd_pending_run(repo, args.id)
 
 
 def cmd_pending_run(repo, pending_id):
+    safe_id(pending_id, "id do pending")
     if not stdin_is_tty():
         raise HxError("pending run exige TTY interativo", EXIT_TTY)
     path = repo.hunt / "pending" / f"{pending_id}.json"
@@ -779,6 +818,8 @@ def rate_effective_interval(scope, state, host):
 
 
 def rate_acquire(scope, repo, host, max_wait, burst=None):
+    if not (isinstance(burst, (list, tuple)) and len(burst) == 2):
+        burst = None
     with flock(repo.hunt / ".lock.rate"):
         state = load_json(repo.rate, {})
         cooldown = (state.get("cooldowns") or {}).get(host)
@@ -801,13 +842,13 @@ def rate_acquire(scope, repo, host, max_wait, burst=None):
             wait = scheduled - t
             if wait > max_wait:
                 raise HxError(f"rate: esperaria {wait:.1f}s (max {max_wait}s)", EXIT_RATE)
-            if wait > 0:
-                sleep(wait)
         host_entry["recent"] = (recent + [scheduled])[-10:]
         host_entry["last"] = scheduled
         state["global"] = scheduled
         dump_json(repo.rate, state)
-        return wait
+    if wait > 0:
+        sleep(wait)
+    return wait
 
 
 def rate_step_up(scope, repo, host, cause):
@@ -819,6 +860,7 @@ def rate_step_up(scope, repo, host, cause):
         new = min(cap, current * 2)
         state.setdefault("effective", {})[host] = new
         state.setdefault("events", []).append({"ts": now(), "host": host, "cause": cause, "interval": new})
+        state["events"] = state["events"][-200:]
         dump_json(repo.rate, state)
         return new
 
@@ -831,6 +873,7 @@ def rate_waf_cooldown(scope, repo, host):
         minutes = min(120, 30 * (2 ** (entry["count"] - 1)))
         entry["until"] = now() + minutes * 60
         state.setdefault("events", []).append({"ts": now(), "host": host, "cause": "waf-cooldown", "minutes": minutes})
+        state["events"] = state["events"][-200:]
         dump_json(repo.rate, state)
         return minutes
 
@@ -849,6 +892,7 @@ def cmd_rate_reset(args):
         state["effective"] = {}
         state["cooldowns"] = {}
         state.setdefault("events", []).append({"ts": now(), "host": "*", "cause": "manual reset", "interval": None})
+        state["events"] = state["events"][-200:]
         dump_json(repo.rate, state)
     print("rate reiniciado — piso e cooldowns restaurados")
 
@@ -857,8 +901,8 @@ HASH_HEADERS = re.compile(r"(?i)^(cookie|set-cookie|authorization)$|token")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"\+?\d[\d\s().-]{8,}\d")
 PAN_RE = re.compile(r"\b\d{13,19}\b")
-SENSITIVE_PAIR_RE = re.compile(r"(?i)(password|passwd|secret|token|csrf|sessionid)=([^&\s\"']+)")
-SENSITIVE_JSON_RE = re.compile(r'(?i)("(?:password|passwd|secret|token|csrf|sessionid)"\s*:\s*")([^"]*)(")')
+SENSITIVE_PAIR_RE = re.compile(r"(?i)(password|passwd|secret|token|csrf|sessionid|api[_-]?key|access[_-]?token|refresh[_-]?token|signature|\bsig|\bauth)=([^&\s\"']+)")
+SENSITIVE_JSON_RE = re.compile(r'(?i)("(?:password|passwd|secret|token|csrf|sessionid|api[_-]?key|access[_-]?token|refresh[_-]?token|signature|sig|auth)"\s*:\s*")([^"]*)(")')
 
 
 def sha12(value):
@@ -898,9 +942,15 @@ def redact_state(value):
     return value
 
 
+MARKER_NESTED_QUANT = re.compile(r"\([^()]*[+*][^()]*\)[+*{]")
+MARKER_ALT_QUANT = re.compile(r"\)[+*{]")
+
+
 def extract_marker(pattern, text):
     if not pattern or not text:
         return None
+    if len(pattern) > 200 or MARKER_NESTED_QUANT.search(pattern) or ("|" in pattern and MARKER_ALT_QUANT.search(pattern)):
+        raise HxError(f"marker rejeitado (ReDoS): {pattern[:80]} — simplifique o padrao", EXIT_GUARD)
     match = re.search(pattern, text)
     if not match:
         return None
@@ -911,6 +961,21 @@ def load_session(path):
     if not path:
         return []
     return load_json(Path(path), [])
+
+
+def resolve_session_path(repo, scope, session_path):
+    if not session_path:
+        return None
+    direct = eng_path(repo, session_path, "sessao")
+    if direct.is_file():
+        return session_path
+    tag = Path(session_path).stem.replace("session_", "")
+    probe = next((p for p in (scope.get("health") or {}).get("probes", []) if p.get("session") == tag), None)
+    if probe and probe.get("file"):
+        probe_file = eng_path(repo, probe["file"], "sessao")
+        if probe_file.is_file():
+            return probe["file"]
+    raise HxError(f"sessao '{session_path}' sem arquivo (tag '{tag}') — use recon/session_<tag>.json ou registre o probe", EXIT_GUARD)
 
 
 def http_request(session, method, url, headers, body):
@@ -937,14 +1002,12 @@ def audit(repo, actor, tool, args_digest, verdict, reason):
 
 
 def save_evidence(repo, dir_path, meta, request, response, proof):
-    dir_path = Path(dir_path)
-    if not dir_path.is_absolute():
-        dir_path = repo.eng / dir_path
+    dir_path = eng_path(repo, dir_path, "save")
     dir_path.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%H%M%S", time.localtime(now()))
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", request["url"])[-80:]
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", redact_body(request.get("url") or ""))[-80:]
     path = dir_path / f"{stamp}_{request['method']}_{safe}_{uuid4().hex[:6]}.json"
-    integrity = response.pop("integrity")
+    integrity = response.pop("integrity", None)
     record = {"meta": meta, "request": request, "response": response, "proof": proof, "integrity": integrity}
     atomic_write(path, json.dumps(record, indent=1, ensure_ascii=False))
     return path
@@ -1015,6 +1078,7 @@ def health_probe_result(repo, tag, ok, signal, status=None, excerpt=None):
         entry = state.setdefault(tag, {"strikes": 0, "first_strike": None, "dead_since": None, "suspect_since": None, "probes": []})
         ts = now()
         entry["probes"].append({"ts": ts, "ok": ok, "signal": signal, "status": status, "excerpt": excerpt})
+        entry["probes"] = entry["probes"][-50:]
         declared = False
         if ok:
             entry["strikes"] = 0
@@ -1130,6 +1194,7 @@ def execute_request(repo, scope, method, url, session_path, body, marker, save_d
             raise HxError(f"sessao '{tag}' (de {session_path}) nao bate com os probes ({', '.join(probe_tags)}) — registre o probe ou renomeie o arquivo", EXIT_GUARD)
         if health_get(repo, tag).get("dead_since"):
             raise HxError(f"sessao {tag} morta — reautentique antes de usar", EXIT_SESSION)
+    session_path = resolve_session_path(repo, scope, session_path)
     max_wait = float(scope["rate"].get("max_wait_s", 30))
     rate_acquire(scope, repo, host, max_wait)
     cookies = load_session(repo.eng / session_path) if session_path else []
@@ -1137,7 +1202,7 @@ def execute_request(repo, scope, method, url, session_path, body, marker, save_d
     apply_health_signals(repo, scope, host, status, resp_headers, text)
     raw_hash = hashlib.sha256((text or "").encode("utf-8", errors="ignore")).hexdigest()
     proof = {"marker": extract_marker(marker, text)} if marker else {}
-    request_record = {"method": method, "url": url, "headers": redact_headers(headers or {}), "body": redact_body(body) if body else None}
+    request_record = {"method": method, "url": redact_body(url), "headers": redact_headers(headers or {}), "body": redact_body(body) if body else None}
     response_record = {
         "status": status,
         "headers": redact_headers(resp_headers),
@@ -1155,6 +1220,7 @@ def guarded_fetch(repo, scope, method, url, session_file=None, headers=None):
         raise HxError(f"guard: {reason}", EXIT_GUARD)
     if classify_method(scope, method, url) == "staged":
         raise HxError(f"metodo estagiado: {method} {url}", EXIT_STAGED)
+    session_file = resolve_session_path(repo, scope, session_file)
     cookies = load_session(repo.eng / session_file) if session_file else []
     host = urlparse(url).hostname or ""
     rate_acquire(scope, repo, host, float(scope["rate"].get("max_wait_s", 30)))
@@ -1226,7 +1292,7 @@ def run_differential(repo, scope, draft):
             repo,
             output_dir,
             {"kind": "verify", "step": step, "draft": draft["id"]},
-            {"method": request["method"], "url": url, "headers": {}, "body": None},
+            {"method": request["method"], "url": redact_body(url), "headers": {}, "body": None},
             {"status": status, "headers": redact_headers(headers), "body": (redact_body(body) or "")[:8192], "integrity": {"raw_sha256": hashlib.sha256((body or "").encode("utf-8", errors="ignore")).hexdigest(), "body_len": len(body or "")}},
             proof,
         )
@@ -1269,7 +1335,7 @@ def run_echo(repo, scope, draft):
         repo,
         output_dir,
         {"kind": "verify", "step": "echo", "canary": canary},
-        {"method": request["method"], "url": url, "headers": {}, "body": None},
+        {"method": request["method"], "url": redact_body(url), "headers": {}, "body": None},
         {"status": status, "headers": redact_headers(headers), "body": (redact_body(body) or "")[:8192],
          "integrity": {"raw_sha256": hashlib.sha256((body or "").encode("utf-8", errors="ignore")).hexdigest(), "body_len": len(body or "")}},
         {"canary": canary, "snippet": snippet},
@@ -1334,7 +1400,7 @@ def run_callback(repo, scope, draft):
         repo,
         output_dir,
         {"kind": "verify", "step": "callback", "baseline_hits": base_count},
-        {"method": request["method"], "url": target_url, "headers": {}, "body": None},
+        {"method": request["method"], "url": redact_body(target_url), "headers": {}, "body": None},
         {"status": status, "headers": redact_headers(headers), "body": (redact_body(body) or "")[:8192],
          "integrity": {"raw_sha256": hashlib.sha256((body or "").encode("utf-8", errors="ignore")).hexdigest(), "body_len": len(body or "")}},
         {"baseline_hits": base_count, "hit": (hit or [])[:1]},
@@ -1390,10 +1456,12 @@ def run_attest(repo, draft, draft_path):
 def cmd_verify(args):
     repo = repo_from_cwd()
     scope = repo.scope()
+    safe_id(args.id, "id")
     draft_path = repo.hunt / "FINDINGS" / "drafts" / f"{args.id}.json"
     draft = load_json(draft_path, None)
     if draft is None:
         raise HxError(f"draft nao encontrado: {args.id}", EXIT_GUARD)
+    draft["id"] = safe_id(draft.get("id") or args.id, "draft id")
     if getattr(args, "attest", False):
         run_attest(repo, draft, draft_path)
         return EXIT_OK
@@ -1488,7 +1556,18 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 return
             host_port = parts[1]
             host = host_port.rsplit(":", 1)[0]
-            port = int(host_port.rsplit(":", 1)[1]) if ":" in host_port else 443
+            try:
+                port = int(host_port.rsplit(":", 1)[1]) if ":" in host_port else 443
+            except ValueError:
+                audit(repo, "proxy", "CONNECT", host_port, "denied", "porta invalida")
+                self.request.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                return
+            bare = host.lower()
+            bare = bare[1:-1] if bare.startswith("[") and bare.endswith("]") else bare
+            if port not in (80, 443) and bare not in LOOPBACK:
+                audit(repo, "proxy", "CONNECT", host_port, "denied", f"porta {port} fora de 80/443")
+                self.request.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                return
             allowed, reason = check_scope(scope, f"https://{host}/")
             if not allowed:
                 audit(repo, "proxy", "CONNECT", host_port, "denied", reason)
