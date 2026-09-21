@@ -160,6 +160,8 @@ def netns_allow_hosts(repo, hyp=None, config_dir=None, models_cache=None, auth_f
                 hosts.add(host)
     provider_hosts = opencode_egress_hosts(config_dir, models_cache, auth_file)
     hosts |= provider_hosts
+    if hx.jev_config(scope).get("enabled"):
+        hosts.add("api.typesafe.ai")
     extras = (scope.get("netns") or {}).get("allow_hosts") or []
     hosts |= {host.lower() for host in extras}
     if not provider_hosts and not extras:
@@ -955,7 +957,9 @@ def runner_main(argv=None):
     os.environ["HX_SESSION"] = owner
     os.environ["HX_RUN_ID"] = f"runner-{repo.eng.name}-{int(hx.now())}"
     budget = {**DEFAULTS, "slices_max": args.slices, "wall_s": args.wall, "token_cap": args.max_tokens, "cost_cap": args.max_cost}
-    hx.TTL_CLAIM_S = claim_ttl_for(budget)
+    ttl = claim_ttl_for(budget)
+    hx.TTL_CLAIM_S = ttl
+    os.environ["HX_CLAIM_TTL_S"] = str(ttl)
     config = os.environ.get("RUNNER_CONFIG_CONTENT") or build_config_content(REPO_ROOT / "opencode" / "agents" / "hunt-auto.md", plan=args.plan)
     ctx = {
         "repo": repo, "hyp": None, "brief": "", "config": config, "owner": owner,
