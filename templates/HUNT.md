@@ -3,7 +3,7 @@
 ## Regras de ouro
 
 - Work order é claim, não pergunta: "confirme ou refute isto" — nunca "procure problemas".
-- Toda saída de rede passa por `hx run`. Mutação fora de `allowed_mutations` é estagiada (exit 5) e executada só pelo dj.
+- Toda saída de rede passa por `hx run`. Mutação fora de `allowed_mutations` é estagiada (exit 5) e executada só pelo dj (`hx pending list/show/run/drop`; item com mais de 7 dias aparece `[stale]`).
 - Refutação por auth-failure exige sessão viva (o `hx result` dispara o probe on-demand).
 - Achado só entra em FINDINGS/ via `hx verify` (cenário PASS) ou `hx verify --attest` (TTY, dj).
 - Evidência redigida na captura; segredos nunca em claro em disco.

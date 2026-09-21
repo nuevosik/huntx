@@ -762,12 +762,38 @@ def stage_pending(repo, spec):
     return pending_id
 
 
+PENDING_STALE_DAYS = 7
+
+
+def pending_age(record):
+    staged = float(record.get("staged_ts") or 0)
+    if not staged:
+        return None
+    return max(0.0, now() - staged)
+
+
+def fmt_age(age):
+    if age is None:
+        return "-"
+    if age < 3600:
+        return f"{int(age // 60)}min"
+    if age < 86400:
+        return f"{int(age // 3600)}h"
+    return f"{int(age // 86400)}d"
+
+
+def pending_stale(record):
+    age = pending_age(record)
+    return age is not None and age > PENDING_STALE_DAYS * 86400
+
+
 def cmd_pending(args):
     repo = repo_from_cwd()
     if args.pending_cmd == "list":
         for path in sorted((repo.hunt / "pending").glob("*.json")):
             record = load_json(path, {})
-            print(f"{record.get('id')} {record.get('method')} {record.get('url')}")
+            marker = " [stale]" if pending_stale(record) else ""
+            print(f"{record.get('id')} {record.get('method')} {record.get('url')} (ha {fmt_age(pending_age(record))}){marker}")
     elif args.pending_cmd == "show":
         safe_id(args.id, "id do pending")
         record = load_json(repo.hunt / "pending" / f"{args.id}.json", None)
@@ -777,6 +803,14 @@ def cmd_pending(args):
     elif args.pending_cmd == "run":
         safe_id(args.id, "id do pending")
         cmd_pending_run(repo, args.id)
+    elif args.pending_cmd == "drop":
+        safe_id(args.id, "id do pending")
+        path = repo.hunt / "pending" / f"{args.id}.json"
+        if not path.exists():
+            raise HxError(f"pending nao encontrado: {args.id}", EXIT_GUARD)
+        path.unlink()
+        audit(repo, "dj", "pending drop", args.id, "dropped", "")
+        print(f"{args.id} removido da fila de pendentes")
 
 
 def cmd_pending_run(repo, pending_id):
@@ -787,6 +821,8 @@ def cmd_pending_run(repo, pending_id):
     record = load_json(path, None)
     if record is None:
         raise HxError(f"pending nao encontrado: {pending_id}", EXIT_GUARD)
+    if pending_stale(record):
+        print(f"aviso: pending estagiado ha {fmt_age(pending_age(record))} — revalide antes de executar")
     scope = repo.scope()
     ok, reason = check_scope(scope, record["url"])
     if not ok:
@@ -1667,6 +1703,8 @@ def main(argv=None):
     pending_show_p.add_argument("id")
     pending_run_p = pending_sub.add_parser("run")
     pending_run_p.add_argument("id")
+    pending_drop_p = pending_sub.add_parser("drop")
+    pending_drop_p.add_argument("id")
     rate_p = sub.add_parser("rate")
     rate_sub = rate_p.add_subparsers(dest="rate_cmd", required=True)
     rate_sub.add_parser("show")
