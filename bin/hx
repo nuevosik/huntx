@@ -3,6 +3,7 @@ import argparse
 import fcntl
 import hashlib
 import html
+import http.server
 import json
 import os
 import re
@@ -463,6 +464,28 @@ def coverage_counts(repo):
                 if len(cells) >= 3:
                     counts[cells[2]] = counts.get(cells[2], 0) + 1
     return counts
+
+
+def parse_coverage_rows(repo):
+    try:
+        text = repo.coverage.read_text()
+    except OSError:
+        return [], True
+    rows = []
+    for line in text.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) < 5:
+            continue
+        if cells[0].lower() == "endpoint":
+            continue
+        if all(set(cell) <= set("-: ") for cell in cells):
+            continue
+        rows.append(cells[:5])
+    if not rows and text.strip():
+        return [], False
+    return rows, True
 
 
 JEV_DEFAULTS = {
@@ -1657,6 +1680,250 @@ def cmd_proxy(args):
         pass
 
 
+def fmt_age(secs):
+    secs = max(0, int(secs or 0))
+    if secs < 3600:
+        return f"{secs // 60}min"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
+
+
+def fmt_ts(ts):
+    return time.strftime("%d/%m %H:%M", time.localtime(ts or 0))
+
+
+UI_CSS = """:root{--background:oklch(0.15 0.003 160);--foreground:oklch(0.92 0.01 160);--card:oklch(0.18 0.003 160);--card-foreground:oklch(0.92 0.01 160);--primary:oklch(0.78 0.21 148);--primary-foreground:oklch(0.16 0.02 148);--muted:oklch(0.21 0.003 160);--muted-foreground:oklch(0.62 0.01 160);--destructive:oklch(0.6 0.23 27);--warning:oklch(0.78 0.16 75);--info:oklch(0.7 0.13 235);--border:oklch(0.29 0.004 160);--radius:0.25rem}
+body{margin:0;background:var(--background);color:var(--foreground);font-family:"Space Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.01em}
+.wrap{max-width:56rem;margin:0 auto;padding:1.5rem}
+h1{font-size:1.25rem;margin:0 0 .25rem}h2{font-size:1rem;margin:2rem 0 .5rem;color:var(--foreground)}
+.sub{color:var(--muted-foreground);font-size:.8rem;margin:0 0 1rem}
+.counts{display:flex;gap:.5rem;flex-wrap:wrap;margin:.75rem 0}
+.pill{border:1px solid var(--border);border-radius:var(--radius);padding:.15rem .6rem;font-size:.8rem}
+.pill b{color:var(--primary)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:.6rem .8rem;margin:.4rem 0}
+.muted{color:var(--muted-foreground);font-size:.8rem}
+table{border-collapse:collapse;width:100%;font-size:.8rem}
+th,td{text-align:left;padding:.3rem .5rem;border-bottom:1px solid var(--border)}
+th{color:var(--muted-foreground);font-weight:400}
+.chip{display:inline-block;border:1px solid var(--border);border-radius:var(--radius);padding:0 .45rem;font-size:.75rem}
+.stale{color:var(--warning)}"""
+
+
+def _esc(value):
+    return html.escape("" if value is None else str(value))
+
+
+def _section(title, inner):
+    return f"<h2>{_esc(title)}</h2>\n{inner}"
+
+
+def _ui_queue(hyps, t):
+    hyps = [h for h in hyps if isinstance(h, dict)] if isinstance(hyps, list) else []
+    groups = {"open": [], "claimed": [], "running": [], "result": []}
+    for hyp in hyps:
+        if hyp.get("status") in groups:
+            groups[hyp.get("status")].append(hyp)
+    parts = []
+    for status in ("open", "claimed", "running", "result"):
+        items = groups[status]
+        parts.append(f"<h2>Fila — {_esc(status)} ({len(items)})</h2>")
+        if not items:
+            parts.append('<p class="muted">sem dados</p>')
+            continue
+        for hyp in items:
+            label = f"[{_esc(hyp.get('id'))}]" + (" [planner]" if hyp.get("source") == "planner" else "")
+            lines = [f"<div class=\"card\"><div><b>{label}</b> {_esc(hyp.get('claim'))}</div>",
+                     f"<div class=\"muted\">{_esc(hyp.get('endpoint'))} | {_esc(hyp.get('class'))}</div>"]
+            if status == "open":
+                lines.append(f"<div class=\"muted\">confirm: {_esc(hyp.get('confirm'))} — refute: {_esc(hyp.get('refute'))}</div>")
+            if status in ("claimed", "running"):
+                cts = hyp.get("claimed_ts")
+                cts = cts if isinstance(cts, (int, float)) else None
+                age = t - cts if cts is not None else 0
+                stale = cts + TTL_CLAIM_S < t if cts is not None else False
+                extra = ' <span class="stale">claim expirado</span>' if stale else ""
+                lines.append(f"<div class=\"muted\">owner: {_esc(hyp.get('owner'))} — há {fmt_age(age)}{extra}</div>")
+            if status == "result":
+                result = hyp.get("result") or {}
+                if not isinstance(result, dict):
+                    result = {}
+                lines.append(f"<div class=\"muted\">verdict: {_esc(result.get('verdict'))} — {_esc(result.get('note'))}</div>")
+            lines.append("</div>")
+            parts.append("\n".join(lines))
+    return "\n".join(parts)
+
+
+def ui_findings(repo):
+    out = []
+    try:
+        paths = sorted((repo.hunt / "FINDINGS").glob("*.json"))
+    except OSError:
+        return out
+    for path in paths:
+        try:
+            data = load_json(path, {})
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        try:
+            verified, _ = finding_verified(repo, path.stem)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if not verified:
+            continue
+        out.append({"id": path.stem,
+                    "verdict": data.get("verdict"),
+                    "note": data.get("note"),
+                    "evidence": data.get("evidence") or data.get("proof_ref")})
+    return out
+
+
+def ui_runs(repo):
+    try:
+        records = read_runs(repo.hunt / "runs.jsonl", 0)
+    except (OSError, UnicodeDecodeError):
+        return []
+    return records[-10:]
+
+
+def ui_sessions(repo):
+    try:
+        names = sorted(path.name for path in (repo.hunt / "sessions").glob("*.md"))
+    except OSError:
+        return []
+    return names[-5:]
+
+
+def render_ui(repo, show_findings=False, interval=15):
+    t = now()
+    try:
+        hyps, _ = load_hyps(repo)
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+        hyps = []
+    hyps = [h for h in hyps if isinstance(h, dict)] if isinstance(hyps, list) else []
+    counts = {"open": 0, "claimed": 0, "running": 0, "result": 0, "dropped": 0}
+    for hyp in hyps:
+        if hyp.get("status") in counts:
+            counts[hyp.get("status")] += 1
+    try:
+        scope = repo.scope()
+        if not isinstance(scope, dict):
+            scope = {}
+        engagement = _esc(scope.get("engagement") or repo.eng.name)
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+        engagement = _esc(repo.eng.name)
+    pills = " ".join(f"<span class=\"pill\">{name}: <b>{counts[name]}</b></span>" for name in ("open", "claimed", "running", "result", "dropped"))
+    body = [f"<h1>hunt — {engagement}</h1>",
+            f"<p class=\"sub\">lido em {fmt_ts(t)} — refresh {max(int(interval), 3)}s</p>",
+            f"<div class=\"counts\">{pills}</div>",
+            _ui_queue(hyps, t)]
+    try:
+        rows, cov_ok = parse_coverage_rows(repo)
+    except (OSError, UnicodeDecodeError):
+        rows, cov_ok = [], False
+    try:
+        counts_txt = " ".join(f"<span class=\"pill\">{_esc(k)}: <b>{v}</b></span>" for k, v in sorted(coverage_counts(repo).items()))
+    except (OSError, UnicodeDecodeError):
+        counts_txt = ""
+    if not rows:
+        cov_inner = "<p class=\"muted\">cobertura ilegível</p>" if not cov_ok else "<p class=\"muted\">sem dados</p>"
+    else:
+        trs = "".join("<tr>" + "".join(f"<td>{f'<span class=\"chip\">{_esc(c)}</span>' if i == 2 else _esc(c)}</td>" for i, c in enumerate(row)) + "</tr>" for row in rows)
+        cov_inner = (f"<div class=\"counts\">{counts_txt}</div>" if counts_txt else "") + \
+            "<table><tr><th>endpoint</th><th>classe</th><th>status</th><th>evidência</th><th>nota</th></tr>" + trs + "</table>"
+    body.append(_section("Cobertura", cov_inner))
+    if show_findings:
+        try:
+            findings = ui_findings(repo)
+        except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+            findings = None
+        if findings is None:
+            f_inner = "<p class=\"muted\">sem dados</p>"
+        elif not findings:
+            f_inner = "<p class=\"muted\">nenhum finding verificado</p>"
+        else:
+            cards = "".join(
+                f"<div class=\"card\"><div><b>[{_esc(f['id'])}]</b> {_esc(f['verdict'])}</div>"
+                f"<div class=\"muted\">{_esc(f['note'])} — evidência: {_esc(f['evidence'])}</div></div>"
+                for f in findings)
+            f_inner = cards
+        body.append(_section("Findings verificados", f_inner))
+    runs = ui_runs(repo)
+    if not runs:
+        r_inner = "<p class=\"muted\">sem dados</p>"
+    else:
+        trs = "".join(
+            f"<tr><td>{_esc(fmt_ts(r.get('ts')))}</td><td>{_esc(r.get('hyp') or r.get('mode') or '-')}</td>"
+            f"<td>{_esc(r.get('tokens'))}</td><td>{_esc(fmt_money(r.get('cost') or 0.0))}</td></tr>"
+            for r in runs)
+        r_inner = "<table><tr><th>hora</th><th>hipótese</th><th>tokens</th><th>custo</th></tr>" + trs + "</table>"
+    body.append(_section("Runs recentes", r_inner))
+    sessions = ui_sessions(repo)
+    s_inner = "<p class=\"muted\">sem dados</p>" if not sessions else \
+        "<div class=\"muted\">" + "<br>".join(_esc(n) for n in sessions) + "</div>"
+    body.append(_section("Sessões", s_inner))
+    page = ("<!doctype html><meta charset=utf8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+            f"<meta http-equiv=\"refresh\" content=\"{max(int(interval), 3)}\">"
+            f"<title>hunt — {engagement}</title><style>{UI_CSS}</style>"
+            f"<div class=\"wrap\">" + "\n".join(body) + "</div>")
+    return page
+
+
+def clamp_interval(value):
+    return max(int(value), 3)
+
+
+class _UiHandler(http.server.BaseHTTPRequestHandler):
+    repo = None
+    show_findings = False
+    interval = 15
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if self.path != "/":
+            self.send_error(404)
+            return
+        try:
+            body = render_ui(type(self).repo, show_findings=type(self).show_findings, interval=type(self).interval)
+        except Exception:
+            data = "<!doctype html><meta charset=utf8><p>sem dados</p>".encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        data = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def cmd_ui(args):
+    eng = Path(args.dir).resolve()
+    if not (eng / "hunt" / "scope.json").exists():
+        raise HxError("engagement nao encontrado (hunt/scope.json)", EXIT_GUARD)
+    repo = Repo(eng)
+    _UiHandler.repo = repo
+    _UiHandler.show_findings = args.show_findings
+    _UiHandler.interval = clamp_interval(args.interval)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), _UiHandler)
+    print(f"hunt panel: http://127.0.0.1:{srv.server_port}/")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    return EXIT_OK
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="hx")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1726,6 +1993,12 @@ def main(argv=None):
     verify_p = sub.add_parser("verify")
     verify_p.add_argument("id")
     verify_p.add_argument("--attest", action="store_true")
+    ui_p = sub.add_parser("ui")
+    ui_p.add_argument("--serve", action="store_true", required=True)
+    ui_p.add_argument("--port", type=int, default=8137)
+    ui_p.add_argument("--dir", default=".")
+    ui_p.add_argument("--interval", type=int, default=15)
+    ui_p.add_argument("--show-findings", dest="show_findings", action="store_true")
     proxy_p = sub.add_parser("proxy")
     proxy_p.add_argument("--port", type=int, default=8899)
     args = parser.parse_args(argv)
@@ -1757,6 +2030,8 @@ def main(argv=None):
             return cmd_run(args)
         elif args.cmd == "verify":
             return cmd_verify(args)
+        elif args.cmd == "ui":
+            return cmd_ui(args)
         elif args.cmd == "proxy":
             return cmd_proxy(args)
         elif args.cmd == "rate":
