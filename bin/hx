@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, unquote, urljoin
 from uuid import uuid4
 
 EXIT_OK = 0
@@ -27,6 +27,9 @@ EXIT_TRANSPORT = 4
 EXIT_STAGED = 5
 EXIT_SESSION = 6
 EXIT_TTY = 7
+
+BODY_LIMIT_DEFAULT = 8192
+BODY_LIMIT_MAX = 4_000_000
 
 
 def now():
@@ -42,7 +45,10 @@ def stdin_is_tty():
 
 
 def read_line(prompt):
-    return input(prompt)
+    try:
+        return input(prompt)
+    except EOFError:
+        raise HxError("entrada encerrada (EOF) — abortado", EXIT_GUARD)
 
 
 class HxError(Exception):
@@ -160,11 +166,12 @@ def cmd_init(args):
     protocol = templates / "HUNT.md"
     if protocol.exists():
         atomic_write(eng / "HUNT.md", protocol.read_text())
-    atomic_write(hunt / ".gitignore", "scans/\nsessions/\n.health.json\n.ratelimit.json\n.runnerstate.json\n.jev.json\npending/\naudit.log\nrunner.pid\nrunner.stop\nruns.jsonl\n.lock.*\n")
+    atomic_write(hunt / ".gitignore", "scans/\nsessions/\nFINDINGS/\npending/\n.omp-sessions/\n*.tmp\nHYPOTHESES.json\nCOVERAGE.md\nTARGET.md\nscope.json\n.health.json\n.ratelimit.json\n.runnerstate.json\n.jev.json\naudit.log\nrunner.pid\nrunner.stop\nruns.jsonl\n.lock.*\n")
     eng_ignore = eng / ".gitignore"
     existing_ignore = eng_ignore.read_text() if eng_ignore.exists() else ""
-    if "recon/session_" not in existing_ignore:
-        atomic_write(eng_ignore, (existing_ignore.rstrip("\n") + "\n" if existing_ignore.strip() else "") + "recon/session_*.json\n")
+    needed = [entry for entry in ("scans/", "recon/session_*.json") if entry not in existing_ignore]
+    if needed:
+        atomic_write(eng_ignore, (existing_ignore.rstrip("\n") + "\n" if existing_ignore.strip() else "") + "\n".join(needed) + "\n")
     print(f"engagement inicializado: {hunt}")
 
 
@@ -172,7 +179,15 @@ TTL_CLAIM_S = 1800
 
 
 def session_tag():
-    return os.environ.get("HX_SESSION") or f"pid-{os.getpid()}"
+    env = os.environ.get("HX_SESSION")
+    if env:
+        return env
+    if stdin_is_tty():
+        try:
+            return f"tty-{os.ttyname(sys.stdin.fileno())}"
+        except OSError:
+            pass
+    return f"pid-{os.getpid()}"
 
 
 def claim_ttl():
@@ -379,27 +394,36 @@ def finding_verified(repo, hypothesis_id):
 
 def cmd_result(args):
     repo = repo_from_cwd()
-    with flock(repo.hunt / ".lock.hyps"):
-        hyps, _ = load_hyps(repo)
-        hyp = next((h for h in hyps if h["id"] == args.id), None)
+
+    def precheck(hyp):
         if not hyp:
             raise HxError(f"hipotese nao encontrada: {args.id}", EXIT_GUARD)
         if hyp["status"] == "result" and not args.force:
             raise HxError("hipotese ja fechada (result) — use --force para refazer", EXIT_GUARD)
         if hyp["owner"] not in (session_tag(), None) and not args.force:
             raise HxError("nao e o dono (use --force)", EXIT_GUARD)
+
+    with flock(repo.hunt / ".lock.hyps"):
+        hyps, _ = load_hyps(repo)
+        hyp = next((h for h in hyps if h["id"] == args.id), None)
+        precheck(hyp)
         if args.verdict == "confirmed":
             verified, reason = finding_verified(repo, hyp["id"])
             if not verified:
                 raise HxError(f"confirmed exige finding verificado ({reason}) — rode hx verify primeiro", EXIT_GUARD)
-        session_check = None
-        if args.verdict == "refuted":
-            session_check = refute_gate(repo, hyp)
-        if args.verdict == "refuted" and not args.force:
-            draft_path = repo.hunt / "FINDINGS" / "drafts" / f"{hyp['id']}.json"
+        snapshot = dict(hyp)
+    session_check = None
+    if args.verdict == "refuted":
+        session_check = refute_gate(repo, snapshot)
+        if not args.force:
+            draft_path = repo.hunt / "FINDINGS" / "drafts" / f"{snapshot['id']}.json"
             blocked_draft = load_json(draft_path, None)
             if blocked_draft and blocked_draft.get("fail_reason") == "no_interaction_timeout":
                 raise HxError("timeout de callback nao refuta — use blocked/unverified, ou --force com prova de ausencia", EXIT_GUARD)
+    with flock(repo.hunt / ".lock.hyps"):
+        hyps, _ = load_hyps(repo)
+        hyp = next((h for h in hyps if h["id"] == args.id), None)
+        precheck(hyp)
         hyp["status"] = "result"
         hyp["closed_ts"] = now()
         hyp["result"] = {"verdict": args.verdict, "note": args.note, "evidence": args.evidence, "session_check": session_check}
@@ -440,7 +464,7 @@ def refute_gate(repo, hyp):
     if not tag or not evidence_auth_failure(repo, hyp):
         return None
     scope = repo.scope()
-    fresh_s = float(scope["health"].get("fresh_max_s", 600))
+    fresh_s = float(health_config(scope)["fresh_max_s"])
     entry = health_get(repo, tag)
     if entry.get("dead_since"):
         raise HxError(f"sessao {tag} morta — use --verdict blocked", EXIT_SESSION)
@@ -459,7 +483,7 @@ def coverage_counts(repo):
     counts = {}
     if repo.coverage.exists():
         for line in repo.coverage.read_text().splitlines():
-            if line.startswith("|") and "---" not in line and "endpoint" not in line:
+            if line.startswith("|") and not line.startswith("| endpoint") and not line.startswith("|---"):
                 cells = [cell.strip() for cell in line.strip("|").split("|")]
                 if len(cells) >= 3:
                     counts[cells[2]] = counts.get(cells[2], 0) + 1
@@ -656,7 +680,8 @@ def read_runs(path, cutoff):
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(record, dict) and (record.get("ts") or 0) > cutoff:
+        ts = record.get("ts") if isinstance(record, dict) else None
+        if isinstance(ts, (int, float)) and ts > cutoff:
             records.append(record)
     return records
 
@@ -733,6 +758,20 @@ def cmd_debrief(args):
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 
 
+def normalize_path(raw):
+    path = unquote(raw or "/")
+    parts = []
+    for segment in path.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(segment)
+    return "/" + "/".join(parts)
+
+
 def host_matches(pattern, host):
     pattern = pattern.lower().strip()
     host = host.lower()
@@ -744,13 +783,13 @@ def host_matches(pattern, host):
 def check_scope(scope, url):
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
-    path = parsed.path or "/"
-    if host in LOOPBACK:
-        return True, None
+    path = normalize_path(parsed.path)
     for banned in scope.get("out_of_scope_paths", []):
-        prefix = banned.rstrip("/")
+        prefix = normalize_path(banned)
         if path == prefix or path.startswith(prefix + "/"):
             return False, f"path banido: {banned}"
+    if host in LOOPBACK:
+        return True, None
     for pattern in scope.get("out_of_scope_hosts", []):
         if host_matches(pattern, host):
             return False, f"host banido: {pattern}"
@@ -798,11 +837,15 @@ def pending_age(record):
 def fmt_age(age):
     if age is None:
         return "-"
-    if age < 3600:
-        return f"{int(age // 60)}min"
-    if age < 86400:
-        return f"{int(age // 3600)}h"
-    return f"{int(age // 86400)}d"
+    try:
+        secs = max(0, int(age))
+    except (TypeError, ValueError, OverflowError):
+        return "-"
+    if secs < 3600:
+        return f"{secs // 60}min"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
 
 
 def pending_stale(record):
@@ -862,8 +905,29 @@ def cmd_pending_run(repo, pending_id):
     return EXIT_OK
 
 
+def rate_config(scope):
+    config = {"per_host_interval_s": 2.0, "global_interval_s": 0.5, "max_wait_s": 30.0, "step_up_max_s": 30.0, "decay_clean_min": 60.0, "burst": None}
+    provided = scope.get("rate")
+    if isinstance(provided, dict):
+        for key in list(config):
+            if key in provided:
+                config[key] = provided[key]
+    return config
+
+
+def health_config(scope):
+    config = {"probes": [], "fresh_max_s": 600.0, "session_invalid_if": [], "waf_block_if": [], "rate_limited_if": []}
+    provided = scope.get("health")
+    if isinstance(provided, dict):
+        for key in list(config):
+            if key in provided:
+                config[key] = provided[key]
+    return config
+
+
 def rate_effective_interval(scope, state, host):
-    floor = float(scope["rate"]["per_host_interval_s"])
+    config = rate_config(scope)
+    floor = float(config["per_host_interval_s"])
     effective = state.get("effective", {}).get(host)
     if not effective:
         return floor
@@ -871,7 +935,7 @@ def rate_effective_interval(scope, state, host):
     if not events:
         return floor
     last_ts = max(event["ts"] for event in events)
-    decay_min = float(scope["rate"].get("decay_clean_min", 60))
+    decay_min = float(config["decay_clean_min"])
     decay = int((now() - last_ts) // (decay_min * 60))
     return max(floor, effective / (2 ** decay))
 
@@ -886,7 +950,7 @@ def rate_acquire(scope, repo, host, max_wait, burst=None):
             remaining = int(cooldown["until"] - now())
             raise HxError(f"waf cooldown: {host} pausado por mais {remaining}s (nivel {cooldown.get('count', 1)}) — retomada manual: hx rate reset", EXIT_RATE)
         interval = rate_effective_interval(scope, state, host)
-        global_interval = float(scope["rate"].get("global_interval_s", 0.5))
+        global_interval = float(rate_config(scope)["global_interval_s"])
         t = now()
         host_entry = state.setdefault("hosts", {}).setdefault(host, {})
         last = host_entry.get("last") or 0
@@ -913,10 +977,11 @@ def rate_acquire(scope, repo, host, max_wait, burst=None):
 def rate_step_up(scope, repo, host, cause):
     with flock(repo.hunt / ".lock.rate"):
         state = load_json(repo.rate, {})
-        floor = float(scope["rate"]["per_host_interval_s"])
-        cap = float(scope["rate"].get("step_up_max_s", 30))
+        config = rate_config(scope)
+        floor = float(config["per_host_interval_s"])
+        cap = float(config["step_up_max_s"])
         current = max(floor, float(state.get("effective", {}).get(host, floor)))
-        new = min(cap, current * 2)
+        new = min(cap, max(current * 2, 1.0))
         state.setdefault("effective", {})[host] = new
         state.setdefault("events", []).append({"ts": now(), "host": host, "cause": cause, "interval": new})
         state["events"] = state["events"][-200:]
@@ -958,8 +1023,20 @@ def cmd_rate_reset(args):
 
 HASH_HEADERS = re.compile(r"(?i)^(cookie|set-cookie|authorization)$|token")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-PHONE_RE = re.compile(r"\+?\d[\d\s().-]{8,}\d")
+PHONE_RE = re.compile(r"(?<![\w.-])(?:\+\d{1,3}[\s.-]?)?(?:\(\d{2,4}\)|\d{2,4})[\s.-]\d{3,5}(?:[\s.-]\d{2,4})?(?![\w.-])")
 PAN_RE = re.compile(r"\b\d{13,19}\b")
+
+
+def luhn_valid(value):
+    digits = [int(char) for char in value]
+    total = 0
+    for index, digit in enumerate(reversed(digits)):
+        if index % 2:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        total += digit
+    return total % 10 == 0
 SENSITIVE_PAIR_RE = re.compile(r"(?i)(password|passwd|secret|token|csrf|sessionid|api[_-]?key|access[_-]?token|refresh[_-]?token|signature|\bsig|\bauth)=([^&\s\"']+)")
 SENSITIVE_JSON_RE = re.compile(r'(?i)("(?:password|passwd|secret|token|csrf|sessionid|api[_-]?key|access[_-]?token|refresh[_-]?token|signature|sig|auth)"\s*:\s*")([^"]*)(")')
 
@@ -986,7 +1063,7 @@ def redact_body(text):
         return text
     redacted = EMAIL_RE.sub("[email-redacted]", text)
     redacted = PHONE_RE.sub("[phone-redacted]", redacted)
-    redacted = PAN_RE.sub("[pan-redacted]", redacted)
+    redacted = PAN_RE.sub(lambda m: "[pan-redacted]" if luhn_valid(m.group(0)) else m.group(0), redacted)
     redacted = SENSITIVE_PAIR_RE.sub(lambda m: f"{m.group(1)}={hash_or_drop(m.group(2))}", redacted)
     return SENSITIVE_JSON_RE.sub(lambda m: m.group(1) + hash_or_drop(m.group(2)) + m.group(3), redacted)
 
@@ -1093,7 +1170,7 @@ def parse_headers(pairs):
 
 
 def apply_health_signals(repo, scope, host, status, headers, body):
-    health_cfg = scope.get("health", {})
+    health_cfg = health_config(scope)
     for sig in health_cfg.get("rate_limited_if", []):
         if signal_matches(sig, status, headers, body):
             rate_step_up(scope, repo, host, f"http-{status}")
@@ -1157,23 +1234,24 @@ def health_probe_result(repo, tag, ok, signal, status=None, excerpt=None):
 
 
 def probe_once(repo, scope, tag):
-    probe = next((p for p in scope["health"]["probes"] if p["session"] == tag), None)
+    health_cfg = health_config(scope)
+    probe = next((p for p in health_cfg["probes"] if p.get("session") == tag), None)
     if probe is None:
         raise HxError(f"sem probe definido para sessao {tag}", EXIT_GUARD)
     cookies = load_session(repo.eng / probe["file"]) if probe.get("file") else []
     host = urlparse(probe["url"]).hostname or ""
-    max_wait = float(scope["rate"].get("max_wait_s", 30))
+    max_wait = float(rate_config(scope)["max_wait_s"])
     rate_acquire(scope, repo, host, max_wait)
     status, headers, body = fetch(probe["method"], probe["url"], probe.get("headers"), None, cookies)
     excerpt = re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f]", " ", body or "")).strip()[:160]
-    for sig in scope["health"]["rate_limited_if"]:
+    for sig in health_cfg["rate_limited_if"]:
         if signal_matches(sig, status, headers, body):
             return False, "ratelimit", status, excerpt
-    for sig in scope["health"]["waf_block_if"]:
+    for sig in health_cfg["waf_block_if"]:
         if signal_matches(sig, status, headers, body):
             rate_waf_cooldown(scope, repo, host)
             return False, "waf", status, excerpt
-    for sig in scope["health"]["session_invalid_if"]:
+    for sig in health_cfg["session_invalid_if"]:
         if signal_matches(sig, status, headers, body):
             return False, "invalid", status, excerpt
     if status in (401, 403, 429, 503) or 300 <= status < 400:
@@ -1226,7 +1304,9 @@ def reopen_sweep(repo, tag, dead_since):
 def cmd_health_check(args):
     repo = repo_from_cwd()
     scope = repo.scope()
-    probes = scope["health"]["probes"]
+    probes = health_config(scope)["probes"]
+    if not probes:
+        raise HxError("sem probes no scope (health.probes) — nada a checar", EXIT_GUARD)
     tags = [args.session] if args.session and args.session != "all" else [p["session"] for p in probes]
     for tag in tags:
         ok, signal, status, excerpt = probe_once(repo, scope, tag)
@@ -1244,7 +1324,7 @@ def cmd_health_check(args):
     return EXIT_OK
 
 
-def execute_request(repo, scope, method, url, session_path, body, marker, save_dir, hypothesis, headers=None):
+def execute_request(repo, scope, method, url, session_path, body, marker, save_dir, hypothesis, headers=None, body_limit=BODY_LIMIT_DEFAULT):
     host = urlparse(url).hostname or ""
     if session_path:
         tag = Path(session_path).stem.replace("session_", "")
@@ -1254,7 +1334,7 @@ def execute_request(repo, scope, method, url, session_path, body, marker, save_d
         if health_get(repo, tag).get("dead_since"):
             raise HxError(f"sessao {tag} morta — reautentique antes de usar", EXIT_SESSION)
     session_path = resolve_session_path(repo, scope, session_path)
-    max_wait = float(scope["rate"].get("max_wait_s", 30))
+    max_wait = float(rate_config(scope)["max_wait_s"])
     rate_acquire(scope, repo, host, max_wait)
     cookies = load_session(repo.eng / session_path) if session_path else []
     status, resp_headers, text = fetch(method, url, headers, body, cookies)
@@ -1265,7 +1345,7 @@ def execute_request(repo, scope, method, url, session_path, body, marker, save_d
     response_record = {
         "status": status,
         "headers": redact_headers(resp_headers),
-        "body": (redact_body(text) or "")[:8192],
+        "body": (redact_body(text) or "")[:body_limit],
         "integrity": {"raw_sha256": raw_hash, "body_len": len(text or "")},
     }
     meta = {"ts": now(), "session": session_path, "hypothesis": hypothesis, "status": status}
@@ -1282,10 +1362,72 @@ def guarded_fetch(repo, scope, method, url, session_file=None, headers=None):
     session_file = resolve_session_path(repo, scope, session_file)
     cookies = load_session(repo.eng / session_file) if session_file else []
     host = urlparse(url).hostname or ""
-    rate_acquire(scope, repo, host, float(scope["rate"].get("max_wait_s", 30)))
+    rate_acquire(scope, repo, host, float(rate_config(scope)["max_wait_s"]))
     status, resp_headers, body = fetch(method, url, headers, None, cookies)
     apply_health_signals(repo, scope, host, status, resp_headers, body)
     return status, resp_headers, body
+
+
+URL_IN_BODY_RE = re.compile(r"""(?:href|src|action)\s*=\s*["\']([^"\'#]+)["\']|<loc>\s*([^<\s]+)\s*</loc>""", re.I)
+ROBOTS_LINE_RE = re.compile(r"(?im)^\s*(disallow|allow|sitemap)\s*:\s*(\S.*)$")
+
+
+def cmd_links(args):
+    repo = repo_from_cwd()
+    scope = repo.scope()
+    directory = eng_path(repo, args.dir or "scans/evidence", "dir de evidencia")
+    if not directory.exists():
+        raise HxError(f"sem evidencia em {args.dir or 'scans/evidence'}", EXIT_GUARD)
+    found = {}
+    robots = {}
+    files = sorted(directory.rglob("*.json"))[:args.files]
+    for path in files:
+        record = load_json(path, {})
+        body = ((record.get("response") or {}).get("body")) or ""
+        if not body:
+            continue
+        base = (record.get("request") or {}).get("url") or ""
+        for line in ROBOTS_LINE_RE.findall(body):
+            robots.setdefault((line[0].lower(), " ".join(line[1].split())), path.name)
+        for match in URL_IN_BODY_RE.finditer(body):
+            raw = (match.group(1) or match.group(2) or "").strip()
+            if not raw:
+                continue
+            url = urljoin(base, raw) if base else raw
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                continue
+            normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            allowed, reason = check_scope(scope, url)
+            if not allowed:
+                found.setdefault(normalized, {"count": 0, "file": path.name, "skip": reason})
+                found[normalized]["count"] += 1
+                continue
+            entry = found.setdefault(normalized, {"count": 0, "file": path.name, "skip": None})
+            entry["count"] += 1
+    ranked = sorted(found.items(), key=lambda item: (-item[1]["count"], item[0]))
+    shown = 0
+    for url, entry in ranked:
+        if entry["skip"]:
+            continue
+        if shown >= args.limit:
+            break
+        shown += 1
+        print(f"{entry['count']:>3}x {url}  [{entry['file']}]")
+    skipped = [(url, entry) for url, entry in ranked if entry["skip"]]
+    if skipped:
+        print(f"-- fora do escopo/banidos: {len(skipped)}")
+        for url, entry in skipped[:5]:
+            print(f"    {url} ({entry['skip']})")
+    if robots:
+        print("-- robots")
+        for (kind, value), name in sorted(robots.items()):
+            marker = "  (candidato a out_of_scope_paths)" if kind == "disallow" else ""
+            print(f"    {kind}: {value}{marker}  [{name}]")
+    if not ranked and not robots:
+        print("(nada encontrado nos corpos de evidencia)")
+    return EXIT_OK
+
 
 
 def cmd_run(args):
@@ -1307,7 +1449,8 @@ def cmd_run(args):
         print(f"staged: hunt/pending/{pending_id}.json — dj executa: hx pending run {pending_id}")
         return EXIT_STAGED
     save_dir = args.save or "scans/evidence/_misc"
-    status, _, _, path = execute_request(repo, scope, args.method.upper(), args.url, args.session, args.data, args.marker, save_dir, args.hypothesis, headers)
+    body_limit = min(max(int(args.body_limit), 512), BODY_LIMIT_MAX)
+    status, _, _, path = execute_request(repo, scope, args.method.upper(), args.url, args.session, args.data, args.marker, save_dir, args.hypothesis, headers, body_limit)
     print(f"{status} {args.method.upper()} {args.url}")
     print(f"evidence: {path.relative_to(repo.eng)}")
     if args.json_out:
@@ -1415,9 +1558,18 @@ def _parse_hits(body):
     return data if isinstance(data, list) else []
 
 
-def _poll_for_new_hit(poll_url, base_count, interval_s, max_polls):
+def guarded_poll(repo, scope, poll_url):
+    allowed, reason = check_scope(scope, poll_url)
+    if not allowed:
+        raise HxError(f"callback: poll do colaborador fora do escopo ({reason}) — registre o host em in_scope/allow_extra_hosts", EXIT_GUARD)
+    host = urlparse(poll_url).hostname or ""
+    rate_acquire(scope, repo, host, float(rate_config(scope)["max_wait_s"]))
+    return fetch("GET", poll_url, {"Accept": "application/json"}, None, None)
+
+
+def _poll_for_new_hit(repo, scope, poll_url, base_count, interval_s, max_polls):
     for attempt in range(max_polls):
-        status, headers, body = fetch("GET", poll_url, {"Accept": "application/json"}, None, None)
+        status, headers, body = guarded_poll(repo, scope, poll_url)
         hits = _parse_hits(body)
         if len(hits) > base_count:
             return hits
@@ -1437,7 +1589,7 @@ def run_callback(repo, scope, draft):
     timeout_s = float(draft.get("interaction_timeout_s", 45))
     interval_s = min(max(interval_s, 1.0), max(timeout_s, 1.0))
     max_polls = max(1, int(timeout_s / interval_s))
-    snapshot_status, snapshot_headers, snapshot_body = fetch("GET", poll_url, {"Accept": "application/json"}, None, None)
+    snapshot_status, snapshot_headers, snapshot_body = guarded_poll(repo, scope, poll_url)
     if not (200 <= snapshot_status < 300):
         raise HxError(f"snapshot do colaborador falhou: status {snapshot_status}", EXIT_TRANSPORT)
     try:
@@ -1453,7 +1605,7 @@ def run_callback(repo, scope, draft):
     base_count = len(snapshot_rows) if isinstance(snapshot_rows, list) else 0
     target_url = request["url"].replace("{collaborator}", collaborator_url)
     status, headers, body = guarded_fetch(repo, scope, request["method"], target_url, draft.get("session"), draft.get("headers"))
-    hit = _poll_for_new_hit(poll_url, base_count, interval_s, max_polls)
+    hit = _poll_for_new_hit(repo, scope, poll_url, base_count, interval_s, max_polls)
     output_dir = repo.hunt / "FINDINGS" / "drafts" / draft["id"]
     save_evidence(
         repo,
@@ -1633,7 +1785,8 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 self.request.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
                 return
             try:
-                rate_acquire(scope, repo, host, float(scope["rate"].get("max_wait_s", 30)), burst=scope["rate"].get("burst"))
+                rate_cfg = rate_config(scope)
+                rate_acquire(scope, repo, host, float(rate_cfg["max_wait_s"]), burst=rate_cfg["burst"])
             except HxError as err:
                 audit(repo, "proxy", "CONNECT", host_port, "rate", str(err))
                 self.request.sendall(f"HTTP/1.1 429 Too Many Requests\r\nX-Hx: {err}\r\n\r\n".encode())
@@ -1678,15 +1831,6 @@ def cmd_proxy(args):
         server.serve_forever()
     except KeyboardInterrupt:
         pass
-
-
-def fmt_age(secs):
-    secs = max(0, int(secs or 0))
-    if secs < 3600:
-        return f"{secs // 60}min"
-    if secs < 86400:
-        return f"{secs // 3600}h"
-    return f"{secs // 86400}d"
 
 
 def fmt_ts(ts):
@@ -1741,7 +1885,7 @@ def _ui_queue(hyps, t):
                 cts = hyp.get("claimed_ts")
                 cts = cts if isinstance(cts, (int, float)) else None
                 age = t - cts if cts is not None else 0
-                stale = cts + TTL_CLAIM_S < t if cts is not None else False
+                stale = cts + claim_ttl() < t if cts is not None else False
                 extra = ' <span class="stale">claim expirado</span>' if stale else ""
                 lines.append(f"<div class=\"muted\">owner: {_esc(hyp.get('owner'))} — há {fmt_age(age)}{extra}</div>")
             if status == "result":
@@ -1879,6 +2023,8 @@ class _UiHandler(http.server.BaseHTTPRequestHandler):
     repo = None
     show_findings = False
     interval = 15
+    server_version = "hx-panel"
+    sys_version = ""
 
     def log_message(self, *args):
         pass
@@ -1904,11 +2050,14 @@ class _UiHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _reject(self):
+        self.send_error(404)
+
+    do_HEAD = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _reject
+
 
 def cmd_ui(args):
-    eng = Path(args.dir).resolve()
-    if not (eng / "hunt" / "scope.json").exists():
-        raise HxError("engagement nao encontrado (hunt/scope.json)", EXIT_GUARD)
+    eng = find_engagement(Path(args.dir).resolve() if args.dir != "." else None)
     repo = Repo(eng)
     _UiHandler.repo = repo
     _UiHandler.show_findings = args.show_findings
@@ -1990,6 +2139,11 @@ def main(argv=None):
     run_p.add_argument("--marker")
     run_p.add_argument("--hypothesis")
     run_p.add_argument("--json", dest="json_out", action="store_true")
+    run_p.add_argument("--body-limit", dest="body_limit", type=int, default=BODY_LIMIT_DEFAULT)
+    links_p = sub.add_parser("links")
+    links_p.add_argument("--dir")
+    links_p.add_argument("--limit", type=int, default=40)
+    links_p.add_argument("--files", type=int, default=200)
     verify_p = sub.add_parser("verify")
     verify_p.add_argument("id")
     verify_p.add_argument("--attest", action="store_true")
@@ -2028,6 +2182,8 @@ def main(argv=None):
             return cmd_health_check(args)
         elif args.cmd == "run":
             return cmd_run(args)
+        elif args.cmd == "links":
+            return cmd_links(args)
         elif args.cmd == "verify":
             return cmd_verify(args)
         elif args.cmd == "ui":

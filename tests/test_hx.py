@@ -287,6 +287,12 @@ class ResultTest(unittest.TestCase):
         self.assertIn("| GET /w/42 | BOLA | confirmed | e | n |", text)
         self.assertIn("| GET /w | BOLA | refuted |", text)
 
+    def test_coverage_counts_not_fooled_by_note_words(self):
+        cov = self.eng / "hunt" / "COVERAGE.md"
+        cov.write_text("| endpoint | classe | status | evidência | nota |\n|---|---|---|---|---|\n| GET /a | BOLA | refuted | e | nenhum endpoint exposto |\n| GET /b | XSS | refuted | e | nota com --- dentro |\n| GET /c | IDOR | blocked | e | n |\n| GET /d | RCE | untested | e | n |\n")
+        counts = hx.coverage_counts(hx.repo_from_cwd())
+        self.assertEqual(counts, {"refuted": 2, "blocked": 1, "untested": 1})
+
 
 class RateTest(unittest.TestCase):
     def setUp(self):
@@ -1234,6 +1240,8 @@ class CallbackTest(unittest.TestCase):
         scope_path = self.eng / "hunt" / "scope.json"
         scope = json.loads(scope_path.read_text())
         scope["in_scope"] = ["www.acme.com"]
+        scope["allow_extra_hosts"] = ["webhook.site"]
+        scope["rate"] = {"per_host_interval_s": 0, "global_interval_s": 0, "max_wait_s": 30}
         scope["jev"] = {"enabled": False}
         scope_path.write_text(json.dumps(scope))
         self.poll_url = "https://webhook.site/token/abc/requests"
@@ -2391,6 +2399,395 @@ class AuditFixTest(unittest.TestCase):
         with self.assertRaises(hx.HxError) as ctx:
             hx.resolve_session_path(self.repo, self.repo.scope(), "b")
         self.assertEqual(ctx.exception.code, hx.EXIT_GUARD)
+
+
+class HardeningTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.eng = Path(self.tmp.name)
+        hx.main(["init", "--dir", str(self.eng)])
+        os.environ["HX_ENGAGEMENT"] = str(self.eng)
+        self.repo = hx.Repo(self.eng)
+        self.orig_fetch = hx.fetch
+        self.orig_tty = hx.stdin_is_tty
+        self.orig_read = hx.read_line
+
+    def tearDown(self):
+        hx.fetch = self.orig_fetch
+        hx.stdin_is_tty = self.orig_tty
+        hx.read_line = self.orig_read
+        for key in ("HX_ENGAGEMENT", "HX_SESSION", "HX_FAKE_NOW"):
+            os.environ.pop(key, None)
+        self.tmp.cleanup()
+
+    def set_scope(self, **values):
+        path = self.repo.hunt / "scope.json"
+        scope = json.loads(path.read_text())
+        scope.update(values)
+        path.write_text(json.dumps(scope))
+        return scope
+
+    def test_session_tag_prefers_env_then_tty(self):
+        os.environ.pop("HX_SESSION", None)
+        hx.stdin_is_tty = lambda: True
+        os.ttyname = lambda fd: "/dev/pts/42"
+        self.assertEqual(hx.session_tag(), "tty-/dev/pts/42")
+        hx.stdin_is_tty = lambda: False
+        self.assertEqual(hx.session_tag(), f"pid-{os.getpid()}")
+        os.environ["HX_SESSION"] = "explicit"
+        self.assertEqual(hx.session_tag(), "explicit")
+
+    def test_banned_path_survives_normalization(self):
+        self.set_scope(in_scope=["acme.com"], out_of_scope_paths=["/admin"])
+        for url in ("https://acme.com/admin", "https://acme.com//admin", "https://acme.com/./admin", "https://acme.com/x/../admin", "https://acme.com/%61dmin", "http://127.0.0.1/admin"):
+            allowed, reason = hx.check_scope(self.repo.scope(), url)
+            self.assertFalse(allowed, url)
+            self.assertIn("path banido", reason)
+        allowed, _ = hx.check_scope(self.repo.scope(), "https://acme.com/administracao")
+        self.assertTrue(allowed)
+
+    def test_callback_poll_requires_registered_host(self):
+        self.set_scope(in_scope=["acme.com"], jev={"enabled": False})
+        draft = {
+            "id": "h001",
+            "scenario": "callback",
+            "request": {"method": "GET", "url": "https://acme.com/fetch?u={collaborator}"},
+            "collaborator": {"url": "https://webhook.site/x", "poll": {"url": "https://nao-registrado.tld/hits"}},
+        }
+        hx.dump_json(self.repo.hunt / "FINDINGS" / "drafts" / "h001.json", draft)
+        called = []
+        hx.fetch = lambda *a, **kw: called.append(a[1]) or (200, {}, "[]")
+        self.assertEqual(hx.main(["verify", "h001"]), hx.EXIT_GUARD)
+        self.assertEqual(called, [])
+
+    def test_callback_poll_is_rate_limited(self):
+        self.set_scope(in_scope=["acme.com"], allow_extra_hosts=["webhook.site"], jev={"enabled": False}, rate={"per_host_interval_s": 2, "global_interval_s": 0.5, "max_wait_s": 30})
+        sleeps = []
+        hx.sleep = lambda seconds: sleeps.append(seconds)
+        hits = []
+        def fake_fetch(method, url, headers=None, body=None, cookies=None):
+            if "webhook.site" in url:
+                hits.append(url)
+                return 200, {}, json.dumps({"data": [{"uuid": "1"}]} if len(hits) > 1 else {"data": []})
+            return 200, {}, "ok"
+        hx.fetch = fake_fetch
+        draft = {
+            "id": "h001",
+            "scenario": "callback",
+            "request": {"method": "GET", "url": "https://acme.com/fetch?u={collaborator}"},
+            "collaborator": {"url": "https://webhook.site/x", "poll": {"url": "https://webhook.site/hits"}},
+            "interaction_timeout_s": 5,
+            "poll_interval_s": 1,
+        }
+        hx.dump_json(self.repo.hunt / "FINDINGS" / "drafts" / "h001.json", draft)
+        try:
+            self.assertEqual(hx.main(["verify", "h001"]), 0)
+        finally:
+            hx.sleep = time.sleep
+        self.assertTrue((self.repo.hunt / "FINDINGS" / "h001.json").exists())
+        self.assertGreater(max(sleeps), 1.5)
+
+    def test_health_check_without_probes_is_refused(self):
+        self.set_scope(health={"probes": [], "fresh_max_s": 600, "session_invalid_if": [], "waf_block_if": [], "rate_limited_if": []})
+        self.assertEqual(hx.main(["health", "check"]), hx.EXIT_GUARD)
+
+    def test_scope_without_rate_uses_defaults(self):
+        path = self.repo.hunt / "scope.json"
+        scope = json.loads(path.read_text())
+        scope.pop("rate")
+        scope["in_scope"] = ["acme.com"]
+        path.write_text(json.dumps(scope))
+        hx.fetch = lambda *a, **kw: (200, {}, "ok")
+        self.assertEqual(hx.main(["run", "GET", "https://acme.com/x", "--save", "scans/evidence/_misc"]), 0)
+
+    def test_rate_step_up_never_zero(self):
+        self.set_scope(rate={"per_host_interval_s": 0, "global_interval_s": 0, "max_wait_s": 30})
+        interval = hx.rate_step_up(self.repo.scope(), self.repo, "acme.com", "http-429")
+        self.assertGreaterEqual(interval, 1.0)
+
+    def test_init_gitignore_covers_engagement_state(self):
+        ignore = (self.repo.hunt / ".gitignore").read_text()
+        for entry in ("scope.json", "HYPOTHESES.json", "COVERAGE.md", "TARGET.md", "FINDINGS/", "scans/", "pending/", ".omp-sessions/"):
+            self.assertIn(entry, ignore)
+        self.assertIn("scans/", (self.eng / ".gitignore").read_text())
+
+    def test_redaction_keeps_dates_versions_and_public_ids(self):
+        text = "lastmod 2026-09-24 phone +55 11 91234-5678 ts 2026-09-24T21:20:15Z ver 1758901234 pixel 1234567890123456 css?mod=1758"
+        out = hx.redact_body(text)
+        self.assertIn("2026-09-24", out)
+        self.assertIn("2026-09-24T21:20:15Z", out)
+        self.assertIn("1758901234", out)
+        self.assertIn("1234567890123456", out)
+        self.assertNotIn("91234-5678", out)
+        self.assertIn("[phone-redacted]", out)
+        self.assertEqual(hx.redact_body("tel (11) 91234-5678"), "tel [phone-redacted]")
+        self.assertEqual(hx.redact_body("mod=1758-09-24"), "mod=1758-09-24")
+        self.assertIn("[pan-redacted]", hx.redact_body("card 4111111111111111 exp"))
+        self.assertIn("4111111111111112", hx.redact_body("card 4111111111111112 invalido"))
+
+    def test_luhn_valid(self):
+        for value in ("4111111111111111", "5500005555555559", "4012888888881881"):
+            self.assertTrue(hx.luhn_valid(value), value)
+        for value in ("4111111111111112", "1234567890123456", "1026678901234"):
+            self.assertFalse(hx.luhn_valid(value), value)
+
+    def test_run_body_limit_is_honored(self):
+        self.set_scope(in_scope=["acme.com"])
+        payload = "<html>" + ("x" * 30000) + "</html>"
+        hx.fetch = lambda *a, **kw: (200, {}, payload)
+        self.assertEqual(hx.main(["run", "GET", "https://acme.com/big", "--save", "scans/evidence/_misc", "--body-limit", "25000"]), 0)
+        record = json.loads(sorted((self.eng / "scans" / "evidence" / "_misc").glob("*.json"))[-1].read_text())
+        self.assertEqual(len(record["response"]["body"]), 25000)
+        self.assertEqual(record["integrity"]["body_len"], len(payload))
+        self.assertEqual(hx.main(["run", "GET", "https://acme.com/small", "--save", "scans/evidence/_misc"]), 0)
+        default = json.loads(sorted((self.eng / "scans" / "evidence" / "_misc").glob("*.json"))[-1].read_text())
+        self.assertEqual(len(default["response"]["body"]), hx.BODY_LIMIT_DEFAULT)
+
+    def test_links_extracts_in_scope_urls_and_robots(self):
+        evidence = self.eng / "scans" / "evidence" / "recon"
+        evidence.mkdir(parents=True, exist_ok=True)
+        home = {
+            "request": {"url": "https://acme.com/pt-br/"},
+            "response": {"body": '<a href="/ranking/characters/all/">r</a><a href="https://acme.com/character/vampire-x-10266/">c</a><img src="https://cdn.terceiro.tld/pixel.png"><a href="/accounts/login/">l</a><form action="/i18n/setlang/"></form><script src="https://acme.com/static/app.js"></script>'},
+        }
+        hx.dump_json(evidence / "0001_home.json", home)
+        robots = {"request": {"url": "https://acme.com/robots.txt"}, "response": {"body": "User-agent: *\nDisallow: /accounts/\nDisallow: /terms-of-service/\nSitemap: https://acme.com/sitemap.xml\n"}}
+        hx.dump_json(evidence / "0002_robots.json", robots)
+        self.set_scope(in_scope=["acme.com"], out_of_scope_paths=["/accounts/"])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(hx.main(["links", "--dir", "scans/evidence", "--limit", "10"]), 0)
+        text = out.getvalue()
+        self.assertIn("https://acme.com/rank", text)
+        self.assertIn("https://acme.com/character/vampire-x-10266/", text)
+        self.assertIn("https://acme.com/i18n/setlang/", text)
+        self.assertIn("https://acme.com/static/app.js", text)
+        listed = text.split("-- fora do escopo")[0]
+        self.assertNotIn("cdn.terceiro.tld", listed)
+        self.assertIn("cdn.terceiro.tld", text)
+        self.assertNotIn("https://acme.com/accounts/login/", listed)
+        self.assertIn("disallow: /accounts/  (candidato a out_of_scope_paths)", text)
+        self.assertIn("sitemap: https://acme.com/sitemap.xml", text)
+
+    def test_debrief_reads_new_record_shape(self):
+        runs = self.repo.hunt / "runs.jsonl"
+        stamp = hx.now()
+        runs.write_text("\n".join(json.dumps(record) for record in [
+            {"ts": stamp, "hyp": "h001", "session": "ses_b", "sessions": ["ses_a", "ses_b"], "attempts": 2, "rc": 124, "tokens": 123, "cost": 0.01, "timeout": True},
+            {"ts": stamp, "mode": "plan", "session": None, "sessions": [], "attempts": 1, "rc": 0, "tokens": None, "cost": None, "proposed": 2},
+        ]) + "\n")
+        self.assertEqual(hx.main(["debrief"]), 0)
+        text = sorted((self.repo.hunt / "sessions").glob("*.md"))[-1].read_text()
+        self.assertIn("runs: 2 | tokens: 123 | custo: 0.01", text)
+        self.assertIn("- h001: runs 1 | tokens: 123 | custo: 0.01", text)
+        self.assertIn("- plan: runs 1 | tokens: 0 | custo: 0", text)
+        self.assertIn("h001: timeout na fatia", text)
+
+    def test_result_probe_runs_outside_queue_lock(self):
+        self.set_scope(in_scope=["acme.com"], health={"probes": [{"session": "s1", "file": "recon/session_s1.json", "method": "GET", "url": "https://acme.com/whoami"}], "fresh_max_s": 600, "session_invalid_if": ["status:401"], "waf_block_if": [], "rate_limited_if": []})
+        hx.main(["hypothesis", "add", "--claim", "c", "--endpoint", "GET /a", "--class", "BOLA", "--confirm", "x", "--refute", "y", "--session-tag", "s1"])
+        (self.eng / "recon").mkdir(exist_ok=True)
+        (self.eng / "recon" / "session_s1.json").write_text("[]")
+        hx.fetch = lambda *a, **kw: (401, {}, "login required")
+        self.assertEqual(hx.main(["run", "GET", "https://acme.com/whoami", "--session", "recon/session_s1.json", "--save", "scans/evidence/h001"]), 0)
+        timeline = []
+        held = {"hyps": 0}
+        orig_flock = hx.flock
+        hyps_lock = str(self.repo.hunt / ".lock.hyps")
+        @contextlib.contextmanager
+        def spy_flock(path):
+            is_hyps = str(path) == hyps_lock
+            if is_hyps:
+                held["hyps"] += 1
+            try:
+                with orig_flock(path):
+                    yield
+            finally:
+                if is_hyps:
+                    held["hyps"] -= 1
+        hx.flock = spy_flock
+        def spy_fetch(*args, **kwargs):
+            timeline.append(("fetch", held["hyps"]))
+            return (401, {}, "login required")
+        hx.fetch = spy_fetch
+        try:
+            self.assertEqual(hx.main(["result", "h001", "--verdict", "refuted", "--note", "401"]), hx.EXIT_SESSION)
+        finally:
+            hx.flock = orig_flock
+        self.assertTrue(timeline)
+        self.assertEqual(timeline[0][1], 0)
+        self.assertEqual(held["hyps"], 0)
+
+
+
+class UiRenderTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        hx.main(["init", "--dir", self.tmp.name])
+        os.environ["HX_ENGAGEMENT"] = self.tmp.name
+        os.environ["HX_SESSION"] = "sess-a"
+        os.environ["HX_FAKE_NOW"] = "1000000"
+
+    def tearDown(self):
+        for key in ("HX_ENGAGEMENT", "HX_SESSION", "HX_FAKE_NOW", "HX_CLAIM_TTL_S"):
+            os.environ.pop(key, None)
+        self.tmp.cleanup()
+
+    def test_header_counts_and_queue_escape(self):
+        hx.main(["hypothesis", "add", "--claim", "BOLA em <script>alert(1)</script>",
+                 "--endpoint", "GET /wishlist/{id}", "--class", "BOLA",
+                 "--confirm", "200 com dado", "--refute", "403/404"])
+        repo = hx.repo_from_cwd()
+        page = hx.render_ui(repo)
+        self.assertIn("open:", page)
+        self.assertIn("BOLA em &lt;script&gt;", page)
+        self.assertNotIn("<script>alert(1)</script>", page)
+        self.assertIn('http-equiv="refresh"', page)
+
+    def test_coverage_table_and_malformed(self):
+        hx.main(["hypothesis", "add", "--claim", "x", "--endpoint", "GET /a",
+                 "--class", "BOLA", "--confirm", "c", "--refute", "r"])
+        hx.main(["result", "h001", "--verdict", "unverified", "--note", "nada ainda", "--force"])
+        repo = hx.repo_from_cwd()
+        page = hx.render_ui(repo)
+        self.assertIn("GET /a", page)
+        self.assertIn("untested", page)
+        (repo.hunt / "COVERAGE.md").write_text("lixo sem tabela\nmais lixo\n")
+        page2 = hx.render_ui(repo)
+        self.assertIn("cobertura ilegível", page2)
+
+    def test_findings_gated_runs_sessions(self):
+        hx.main(["hypothesis", "add", "--claim", "BOLA real", "--endpoint", "GET /b",
+                 "--class", "BOLA", "--confirm", "c", "--refute", "r"])
+        (repo_hunt := hx.repo_from_cwd().hunt)
+        (repo_hunt / "FINDINGS" / "h001.json").write_text(json.dumps({"verdict": "verified-manual"}))
+        hx.main(["result", "h001", "--verdict", "confirmed", "--note", "ok", "--force"])
+        repo = hx.repo_from_cwd()
+        (repo.hunt / "runs.jsonl").write_text(json.dumps({"ts": 1000001, "hyp": "h001", "tokens": 120, "cost": 0.02}) + "\n")
+        (repo.hunt / "sessions").mkdir(exist_ok=True)
+        (repo.hunt / "sessions" / "2026-09-18-01.md").write_text("# s\n")
+        hidden = hx.render_ui(repo)
+        self.assertNotIn("verified-manual", hidden)
+        self.assertNotIn("Findings verificados", hidden)
+        shown = hx.render_ui(repo, show_findings=True)
+        self.assertIn("verified-manual", shown)
+        self.assertIn("120", shown)
+        self.assertIn("2026-09-18-01.md", shown)
+
+    def test_findings_non_dict_file_degrades(self):
+        repo = hx.repo_from_cwd()
+        (repo.hunt / "FINDINGS" / "h002.json").write_text("[]")
+        page = hx.render_ui(repo, show_findings=True)
+        self.assertIn("nenhum finding verificado", page)
+
+    def test_non_dict_hyps_queue_empty(self):
+        repo = hx.repo_from_cwd()
+        (repo.hunt / "HYPOTHESES.json").write_text("[123]")
+        page = hx.render_ui(repo)
+        self.assertIn("Fila", page)
+        self.assertIn("sem dados", page)
+
+    def test_coverage_status_renders_chip(self):
+        hx.main(["hypothesis", "add", "--claim", "x", "--endpoint", "GET /c",
+                 "--class", "BOLA", "--confirm", "c", "--refute", "r"])
+        hx.main(["result", "h001", "--verdict", "unverified", "--note", "n", "--force"])
+        page = hx.render_ui(hx.repo_from_cwd())
+        self.assertIn('class="chip"', page)
+        self.assertIn("untested", page)
+
+
+    def test_claim_stale_follows_harness_ttl(self):
+        hx.main(["hypothesis", "add", "--claim", "x", "--endpoint", "GET /d",
+                 "--class", "BOLA", "--confirm", "c", "--refute", "r"])
+        hx.main(["next", "1"])
+        repo = hx.repo_from_cwd()
+        os.environ["HX_FAKE_NOW"] = str(1000000 + 3600)
+        os.environ["HX_CLAIM_TTL_S"] = "7200"
+        page = hx.render_ui(repo)
+        self.assertIn("Fila — claimed (1)", page)
+        self.assertNotIn("claim expirado", page)
+        os.environ.pop("HX_CLAIM_TTL_S")
+        page = hx.render_ui(repo)
+        self.assertIn("Fila — open (1)", page)
+        self.assertNotIn("claim expirado", page)
+
+
+    def test_non_finite_claimed_ts_degrades(self):
+        repo = hx.repo_from_cwd()
+        hx.dump_json(repo.hyps, [{"id": "h001", "status": "claimed", "claim": "c", "endpoint": "GET /w",
+                                 "class": "BOLA", "confirm": "x", "refute": "y", "owner": "s",
+                                 "claimed_ts": float("nan")}])
+        page = hx.render_ui(repo)
+        self.assertIn("Fila — claimed (1)", page)
+        self.assertIn("owner: s", page)
+
+    def test_non_numeric_run_ts_degrades(self):
+        repo = hx.repo_from_cwd()
+        (repo.hunt / "runs.jsonl").write_text(json.dumps({"ts": "5", "hyp": "h001"}) + "\n")
+        page = hx.render_ui(repo)
+        self.assertIn("Runs recentes", page)
+        self.assertIn("sem dados", page)
+
+
+class UiServeTest(unittest.TestCase):
+    def test_get_root_200_and_other_404(self):
+        import threading
+        import urllib.request
+        import urllib.error
+        with tempfile.TemporaryDirectory() as tmp:
+            hx.main(["init", "--dir", tmp])
+            hx._UiHandler.repo = hx.Repo(tmp)
+            hx._UiHandler.show_findings = False
+            hx._UiHandler.interval = 15
+            srv = hx.http.server.ThreadingHTTPServer(("127.0.0.1", 0), hx._UiHandler)
+            thread = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05})
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{srv.server_port}/"
+                with urllib.request.urlopen(url, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    self.assertIn("text/html", resp.headers.get("Content-Type"))
+                    self.assertIn("hunt", resp.read().decode("utf-8"))
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(url + "x", timeout=5)
+                self.assertEqual(ctx.exception.code, 404)
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(urllib.request.Request(url, method="POST"), timeout=5)
+                self.assertEqual(ctx.exception.code, 404)
+            finally:
+                srv.shutdown()
+                thread.join()
+                srv.server_close()
+
+    def test_interval_floor(self):
+        self.assertEqual(hx.clamp_interval(0), 3)
+        self.assertEqual(hx.clamp_interval(-5), 3)
+        self.assertEqual(hx.clamp_interval(15), 15)
+
+    def test_poisoned_claimed_ts_still_200(self):
+        import threading
+        import urllib.request
+        with tempfile.TemporaryDirectory() as tmp:
+            hx.main(["init", "--dir", tmp])
+            repo = hx.Repo(tmp)
+            hx.dump_json(repo.hyps, [{"id": "h001", "status": "claimed", "claim": "c",
+                                     "endpoint": "GET /w", "class": "BOLA", "confirm": "x",
+                                     "refute": "y", "owner": "sess-a", "claimed_ts": "em-breve"}])
+            hx._UiHandler.repo = repo
+            hx._UiHandler.show_findings = False
+            hx._UiHandler.interval = 15
+            srv = hx.http.server.ThreadingHTTPServer(("127.0.0.1", 0), hx._UiHandler)
+            thread = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05})
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{srv.server_port}/"
+                with urllib.request.urlopen(url, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    self.assertIn("hunt", resp.read().decode("utf-8"))
+            finally:
+                srv.shutdown()
+                thread.join()
+                srv.server_close()
 
 
 if __name__ == "__main__":
