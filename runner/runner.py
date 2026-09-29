@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import fcntl
 import importlib.machinery
 import importlib.util
 import json
@@ -148,24 +149,26 @@ def opencode_egress_hosts(config_dir=None, models_cache=None, auth_file=None):
     return hosts
 
 
-def netns_allow_hosts(repo, hyp=None, config_dir=None, models_cache=None, auth_file=None):
+def netns_allow_hosts(repo, hyp=None, config_dir=None, models_cache=None, auth_file=None, runtime="opencode"):
     scope = repo.scope()
     hosts = {entry.lower().lstrip("*.") for entry in (scope.get("in_scope") or [])}
     if hyp:
-        hosts |= hosts_in_text(hyp.get("endpoint"))
+        for host in hosts_in_text(hyp.get("endpoint")):
+            if hx.check_scope(scope, f"https://{host}/")[0]:
+                hosts.add(host)
     target = repo.hunt / "TARGET.md"
     if target.exists():
         for host in hosts_in_text(target.read_text()):
             if hx.check_scope(scope, f"https://{host}/")[0]:
                 hosts.add(host)
-    provider_hosts = opencode_egress_hosts(config_dir, models_cache, auth_file)
+    provider_hosts = omp_egress_hosts() if runtime == "omp" else opencode_egress_hosts(config_dir, models_cache, auth_file)
     hosts |= provider_hosts
     if hx.jev_config(scope).get("enabled"):
         hosts.add("api.typesafe.ai")
     extras = (scope.get("netns") or {}).get("allow_hosts") or []
     hosts |= {host.lower() for host in extras}
     if not provider_hosts and not extras:
-        raise hx.HxError("netns: provedor LLM nao derivavel e sem netns.allow_hosts — worker recusado", hx.EXIT_GUARD)
+        raise hx.HxError(f"netns: provedor LLM do runtime {runtime} nao derivavel e sem netns.allow_hosts — declare o host do provedor em scope.json e re-rode", hx.EXIT_GUARD)
     return hosts
 
 
@@ -248,7 +251,7 @@ def netns_preflight():
 
 def agent_argv(argv):
     if os.environ.get("HX_NETNS") == "1":
-        return ["setpriv", "--bounding-set=-net_admin", "--"] + list(argv)
+        return ["setpriv", "--bounding-set=-net_admin,-net_raw", "--"] + list(argv)
     return list(argv)
 
 
@@ -351,6 +354,52 @@ def count_planner_hyps(repo):
     return sum(1 for hyp in hyps if hyp.get("source") == "planner")
 
 
+_INFLIGHT = {}
+
+
+def kill_inflight():
+    for pid in list(_INFLIGHT):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _stop_signal(signum, frame):
+    kill_inflight()
+    os._exit(128 + signum)
+
+
+def spawn_agent(argv, cwd, env, timeout_s):
+    proc = subprocess.Popen(argv, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    _INFLIGHT[proc.pid] = proc
+    try:
+        try:
+            out, err = proc.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                out, err = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            return (124, out or "", err or "")
+        return (proc.returncode, out, err)
+    finally:
+        _INFLIGHT.pop(proc.pid, None)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+
 def invoke_opencode(prompt, cwd, config_content, timeout_s, model=None, resume_session=None, env_extra=None):
     env = dict(os.environ)
     env["OPENCODE_CONFIG_CONTENT"] = config_content
@@ -362,21 +411,26 @@ def invoke_opencode(prompt, cwd, config_content, timeout_s, model=None, resume_s
     if resume_session:
         argv += ["--continue", "--session", resume_session]
     argv.append(prompt)
-    proc = subprocess.Popen(argv, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-    try:
-        out, err = proc.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        out, err = "", ""
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            out, err = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
-        return (124, out or "", err or "")
-    return (proc.returncode, out, err)
+    return spawn_agent(argv, cwd, env, timeout_s)
+
+
+def invoke_omp(prompt, cwd, timeout_s, model=None, resume_session=None, env_extra=None, plan=False, session_dir=None):
+    env = dict(os.environ)
+    env["HX_OMP_BASH_MODE"] = omp_bash_mode(plan)
+    if env_extra:
+        env.update(env_extra)
+    argv = agent_argv(omp_argv(cwd, prompt, model, resume_session, timeout_s, plan, session_dir))
+    return spawn_agent(argv, cwd, env, timeout_s)
+
+
+def invoke_agent(ctx, prompt, resume_session=None):
+    runtime = ctx.get("runtime") or "opencode"
+    timeout_s = ctx.get("slice_timeout_s") or DEFAULTS["slice_timeout_s"]
+    owner = ctx.get("owner")
+    env_extra = {"HX_SESSION": owner} if owner else None
+    if runtime == "omp":
+        return invoke_omp(prompt, ctx["repo"].eng, timeout_s, ctx.get("model"), resume_session, env_extra, bool(ctx.get("plan")), ctx.get("session_dir"))
+    return invoke_opencode(prompt, ctx["repo"].eng, ctx["config"], timeout_s, ctx.get("model"), resume_session=resume_session, env_extra=env_extra)
 
 
 def parse_session_id(stdout):
@@ -394,6 +448,120 @@ def parse_session_id(stdout):
     return None
 
 
+OMP_SESSION_DIR = ".omp-sessions"
+OMP_GUARD_HOOK = REPO_ROOT / "runner" / "omp" / "guard-hook.ts"
+
+
+def detect_runtime(explicit=None):
+    if explicit:
+        return explicit
+    if shutil.which("opencode"):
+        return "opencode"
+    if shutil.which("omp"):
+        return "omp"
+    raise hx.HxError("nem opencode nem omp no PATH — instale um dos dois ou passe --runtime", hx.EXIT_GUARD)
+
+
+def omp_session_root(eng, slice_name=None):
+    root = Path(eng) / "hunt" / OMP_SESSION_DIR
+    return root / slice_name if slice_name else root
+
+
+OMP_SESSION_NAME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.-]+Z_[0-9a-f-]{36}\.jsonl$")
+
+
+def omp_session_files(eng, slice_name=None):
+    root = omp_session_root(eng, slice_name)
+    if not root.exists():
+        return set()
+    found = {path for path in root.glob("*.jsonl") if OMP_SESSION_NAME_RE.match(path.name)}
+    found |= {path for path in root.glob("*/*.jsonl") if OMP_SESSION_NAME_RE.match(path.name)}
+    return found
+
+
+def omp_session_id(path):
+    try:
+        with open(path, errors="ignore") as handle:
+            for line in handle:
+                if '"session"' not in line or '"id"' not in line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    continue
+                if data.get("type") == "session" and data.get("id"):
+                    return str(data["id"])
+    except Exception:
+        return None
+    return None
+
+
+def omp_session_usage(path):
+    tokens = 0
+    cost = 0.0
+    seen = False
+    try:
+        with open(path, errors="ignore") as handle:
+            for line in handle:
+                if "model_usage" not in line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    continue
+                if data.get("type") != "model_usage":
+                    continue
+                usage = data.get("usage") or {}
+                seen = True
+                tokens += usage.get("totalTokens") or 0
+                money = usage.get("cost")
+                if isinstance(money, dict):
+                    cost += money.get("total") or 0.0
+                elif isinstance(money, (int, float)):
+                    cost += money
+    except Exception:
+        return {}
+    if not seen:
+        return {}
+    return {"tokens": tokens or None, "cost": cost or None}
+
+
+def omp_egress_hosts(config_dir=None):
+    hosts = set()
+    agent_dir = Path(config_dir or os.environ.get("PI_CODING_AGENT_DIR") or Path.home() / ".omp" / "agent")
+    for name in ("models.yml", "config.yml"):
+        path = agent_dir / name
+        if not path.exists():
+            continue
+        for match in re.finditer(r"https?://([A-Za-z0-9.-]+)", path.read_text(errors="ignore")):
+            host = match.group(1).lower()
+            if host and host not in ("localhost", "127.0.0.1", "::1"):
+                hosts.add(host)
+    return hosts
+
+
+def omp_argv(eng, prompt, model, resume_session, slice_timeout_s, plan, session_dir=None):
+    argv = ["omp", "--print", "--auto-approve", "--no-title", "--no-skills"]
+    if model:
+        argv += ["--model", model]
+    if resume_session:
+        argv += ["--resume", resume_session]
+    argv += ["--session-dir", str(omp_session_root(eng, session_dir))]
+    if OMP_GUARD_HOOK.exists():
+        argv += ["--hook", str(OMP_GUARD_HOOK)]
+    agent_md = REPO_ROOT / "opencode" / "agents" / "hunt-auto.md"
+    if agent_md.exists():
+        argv += ["--append-system-prompt", str(agent_md)]
+    if slice_timeout_s:
+        argv += ["--max-time", str(int(slice_timeout_s))]
+    argv += ["--", prompt]
+    return argv
+
+
+def omp_bash_mode(plan):
+    return "plan" if plan else "hx-only"
+
+
 def is_rate_failure(text):
     lowered = (text or "").lower()
     return any(marker in lowered for marker in ("rate limit", "429", "waf", "captcha"))
@@ -402,17 +570,32 @@ def is_rate_failure(text):
 def retry_invoke(ctx, prompt):
     attempts = 0
     session = None
+    sessions = []
+    runtime = ctx.get("runtime") or "opencode"
     budget = ctx.get("budget") or DEFAULTS
-    owner = ctx.get("owner")
-    env_extra = {"HX_SESSION": owner} if owner else None
+    slice_name = ctx.get("session_dir")
+    seen_sessions = {str(path) for path in omp_session_files(ctx["repo"].eng, slice_name)} if runtime == "omp" else set()
     rc, stdout, stderr = 1, "", ""
     while attempts < budget["backoff_attempts"]:
         if attempts and ((ctx["repo"].hunt / "runner.stop").exists() or hx.now() - ctx.get("started_ts", hx.now()) >= budget["wall_s"]):
             break
         attempts += 1
-        rc, stdout, stderr = invoke_opencode(
-            prompt, ctx["repo"].eng, ctx["config"], ctx.get("slice_timeout_s") or DEFAULTS["slice_timeout_s"], ctx.get("model"), resume_session=session, env_extra=env_extra
-        )
+        rc, stdout, stderr = invoke_agent(ctx, prompt, resume_session=session)
+        if runtime == "omp":
+            fresh = sorted({str(path) for path in omp_session_files(ctx["repo"].eng, slice_name)} - seen_sessions)
+            seen_sessions |= set(fresh)
+            refs = fresh
+            sid = None
+            for ref in fresh:
+                sid = omp_session_id(ref)
+                if sid:
+                    break
+        else:
+            sid = parse_session_id(stdout)
+            refs = [sid] if sid else []
+        for ref in refs:
+            if ref not in sessions:
+                sessions.append(ref)
         if rc in (0, 124):
             break
         text = f"{stdout}\n{stderr}"
@@ -420,15 +603,18 @@ def retry_invoke(ctx, prompt):
             wait = min(budget["rate_backoff_max_s"], budget["rate_backoff_s"] * (2 ** (attempts - 1)))
         else:
             wait = min(budget["backoff_max_s"], budget["backoff_base_s"] * (2 ** (attempts - 1)))
-        session = session or parse_session_id(stdout)
+        session = session or sid
         if attempts < budget["backoff_attempts"]:
             hx.sleep(wait)
-    return rc, stdout, stderr, attempts
+    return rc, stdout, stderr, attempts, sessions
 
 
-def export_usage(hx_mod, session_id):
-    if not session_id:
+def export_usage(hx_mod, session_ref, runtime="opencode"):
+    if not session_ref:
         return {}
+    if runtime == "omp":
+        return omp_session_usage(session_ref)
+    session_id = session_ref
     tmp = None
     try:
         fd, name = tempfile.mkstemp(suffix=".json")
@@ -485,18 +671,30 @@ def adjudicate(repo, hid):
 def run_slice(ctx):
     repo = ctx["repo"]
     hyp = ctx["hyp"]
+    ctx["session_dir"] = f"{hyp['id']}-{int(hx.now())}-{os.getpid()}"
     prompt = build_prompt(hyp, ctx.get("brief") or "", ctx.get("slice_timeout_s") or DEFAULTS["slice_timeout_s"])
-    rc, stdout, stderr, attempts = retry_invoke(ctx, prompt)
-    session = parse_session_id(stdout)
-    usage = export_usage(hx, session) if session else {}
+    rc, stdout, stderr, attempts, sessions = retry_invoke(ctx, prompt)
+    runtime = ctx.get("runtime") or "opencode"
+    session = sessions[-1] if sessions else None
+    if runtime == "omp" and session:
+        session = omp_session_id(session) or session
+    tokens = 0
+    cost = 0.0
+    for sid in sessions:
+        part = export_usage(hx, sid, runtime)
+        tokens += part.get("tokens") or 0
+        cost += part.get("cost") or 0
     record = {
         "ts": hx.now(),
         "hyp": hyp["id"],
         "session": session,
+        "sessions": sessions,
+        "attempts": attempts,
         "worker": ctx.get("worker"),
+        "omp_session_dir": ctx.get("session_dir"),
         "rc": rc,
-        "tokens": usage.get("tokens"),
-        "cost": usage.get("cost"),
+        "tokens": tokens or None,
+        "cost": cost or None,
         "stderr": (stderr or "")[:400],
     }
     if rc == 124:
@@ -514,12 +712,26 @@ def run_slice(ctx):
 
 def run_plan(ctx):
     repo = ctx["repo"]
+    ctx["session_dir"] = f"plan-{int(hx.now())}-{os.getpid()}"
     plan_n = ctx.get("plan_n") or 5
     prompt = PLAN_TEMPLATE.format(digest=build_plan_digest(repo, plan_n), n=plan_n)
     before = count_planner_hyps(repo)
-    rc, stdout, _, _ = retry_invoke(ctx, prompt)
-    session = parse_session_id(stdout)
-    usage = export_usage(hx, session) if session else {}
+    rc, stdout, _, _, sessions = retry_invoke(ctx, prompt)
+    runtime = ctx.get("runtime") or "opencode"
+    session = sessions[-1] if sessions else None
+    if runtime == "omp" and session:
+        session = omp_session_id(session) or session
+    tokens = 0
+    cost = 0.0
+    for sid in sessions:
+        part = export_usage(hx, sid, runtime)
+        tokens += part.get("tokens") or 0
+        cost += part.get("cost") or 0
+    if rc not in (0, 124):
+        record = {"ts": hx.now(), "mode": "plan", "session": session, "sessions": sessions, "rc": rc, "tokens": tokens or None, "cost": cost or None, "proposed": 0, "failed": True}
+        record_run(repo, record)
+        print(f"runner: planner terminou com rc={rc} (registrado em runs.jsonl)")
+        return record
     if hx.jev_config(repo.scope())["enabled"]:
         updates = {}
         hyps, _ = hx.load_hyps(repo)
@@ -548,9 +760,10 @@ def run_plan(ctx):
         "ts": hx.now(),
         "mode": "plan",
         "session": session,
+        "sessions": sessions,
         "rc": rc,
-        "tokens": usage.get("tokens"),
-        "cost": usage.get("cost"),
+        "tokens": tokens or None,
+        "cost": cost or None,
         "proposed": count_planner_hyps(repo) - before,
     }
     record_run(repo, record)
@@ -598,6 +811,7 @@ def write_pid(repo):
 def install_signals(ctx):
     def handler(signum, frame):
         request_stop(ctx["repo"])
+        kill_inflight()
     signal.signal(signal.SIGTERM, handler)
     signal.signal(signal.SIGINT, handler)
 
@@ -686,12 +900,12 @@ def netns_worker_enter(ctx):
         Path("/proc/sys/net/ipv6/conf/all/disable_ipv6").write_text("1")
     except OSError:
         pass
-    ips = resolve_ips(netns_allow_hosts(ctx["repo"]))
+    ips = resolve_ips(netns_allow_hosts(ctx["repo"], runtime=ctx.get("runtime")))
     apply_netns_rules(ips, netns_resolvers())
 
 
 def netns_refresh(ctx, hyp):
-    ips = resolve_ips(netns_allow_hosts(ctx["repo"], hyp))
+    ips = resolve_ips(netns_allow_hosts(ctx["repo"], hyp, runtime=ctx.get("runtime")))
     apply_netns_rules(ips, netns_resolvers())
 
 
@@ -718,6 +932,7 @@ def worker_loop(ctx):
         alive, tag = health_gate(hx, repo, hyp)
         if not alive:
             hx.main(["result", hyp["id"], "--verdict", "blocked", "--note", f"sessao {tag} morta"])
+            runner_state_release_slice(repo)
             continue
         ctx["hyp"] = hyp
         record = run_slice(ctx)
@@ -725,7 +940,8 @@ def worker_loop(ctx):
 
 
 def worker_entry(queue, ctx):
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, _stop_signal)
+    signal.signal(signal.SIGINT, _stop_signal)
     queue.put(worker_loop(ctx))
 
 
@@ -839,7 +1055,7 @@ def netns_selfcheck_child(child_ctrl):
             checks["out_of_scope_blocked"] = True
         result = subprocess.run(["nft", "list", "ruleset"], capture_output=True, text=True)
         checks["rules_present"] = "policy drop" in (result.stdout or "")
-        tamper = subprocess.run(["setpriv", "--bounding-set=-net_admin", "--", "nft", "add", "table", "inet", "tamper"], capture_output=True, text=True)
+        tamper = subprocess.run(["setpriv", "--bounding-set=-net_admin,-net_raw", "--", "nft", "add", "table", "inet", "tamper"], capture_output=True, text=True)
         checks["agent_cannot_tamper"] = tamper.returncode != 0
         print(json.dumps(checks), flush=True)
         os._exit(0 if all(checks.values()) else 1)
@@ -894,6 +1110,16 @@ def netns_selfcheck():
     return next((code for code in codes if code != 0), 1)
 
 
+def acquire_runner_lock(repo):
+    handle = open(repo.hunt / ".lock.runner.pid", "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
 def runner_main(argv=None):
     parser = argparse.ArgumentParser(prog="runner")
     parser.add_argument("--engagement", default=".")
@@ -908,10 +1134,36 @@ def runner_main(argv=None):
     parser.add_argument("--netns-selfcheck", dest="netns_selfcheck", action="store_true")
     parser.add_argument("--max-tokens", dest="max_tokens", type=int, default=None)
     parser.add_argument("--max-cost", dest="max_cost", type=float, default=None)
+    parser.add_argument("--runtime", choices=("opencode", "omp"), default=None)
     args = parser.parse_args(argv)
+    if args.slices < 0:
+        print("runner: --slices nao pode ser negativo")
+        return 2
+    if args.max_tokens is not None and args.max_tokens <= 0:
+        print("runner: --max-tokens precisa ser > 0")
+        return 2
+    if args.max_cost is not None and args.max_cost <= 0:
+        print("runner: --max-cost precisa ser > 0")
+        return 2
+    if args.wall <= 0:
+        print("runner: --wall precisa ser > 0")
+        return 2
+    needs_userns = args.netns or args.netns_selfcheck
+    raw_argv = list(argv if argv is not None else sys.argv[1:])
+    if needs_userns and not shutil.which("unshare"):
+        print("runner: unshare ausente (util-linux)")
+        return 2
+    if needs_userns and os.environ.get("HX_NETNS") != "1":
+        env = dict(os.environ, HX_NETNS="1")
+        os.execvpe("unshare", ["unshare", "-Ur", "--", sys.executable, str(Path(__file__).resolve()), *raw_argv], env)
     if args.netns_selfcheck:
         return netns_selfcheck()
     repo = hx.Repo(Path(args.engagement).resolve())
+    try:
+        runtime = detect_runtime(args.runtime)
+    except hx.HxError as err:
+        print(f"runner: {err}")
+        return 2
     pid_file = repo.hunt / "runner.pid"
     if pid_file.exists():
         try:
@@ -931,13 +1183,10 @@ def runner_main(argv=None):
     if args.plan and args.workers > 1:
         print("runner: --plan nao combina com --workers > 1")
         return 2
-    if args.netns and not shutil.which("unshare"):
-        print("runner: unshare ausente (util-linux)")
-        return 2
-    raw_argv = list(argv if argv is not None else sys.argv[1:])
-    if args.netns and os.environ.get("HX_NETNS") != "1":
-        env = dict(os.environ, HX_NETNS="1")
-        os.execvpe("unshare", ["unshare", "-Ur", "--", sys.executable, str(Path(__file__).resolve()), *raw_argv], env)
+    runner_lock = acquire_runner_lock(repo)
+    if runner_lock is None:
+        print("runner: outro runner esta iniciando neste engagement (lock ocupado)")
+        return 1
     if args.netns:
         problems = netns_preflight()
         if problems:
@@ -952,6 +1201,7 @@ def runner_main(argv=None):
             print(f"  - {problem}")
         return 2
     (repo.hunt / "runner.stop").unlink(missing_ok=True)
+    print(f"runner: runtime {runtime}")
     os.environ["HX_ENGAGEMENT"] = str(repo.eng)
     owner = f"runner-{os.getpid()}"
     os.environ["HX_SESSION"] = owner
@@ -960,19 +1210,21 @@ def runner_main(argv=None):
     ttl = claim_ttl_for(budget)
     hx.TTL_CLAIM_S = ttl
     os.environ["HX_CLAIM_TTL_S"] = str(ttl)
-    config = os.environ.get("RUNNER_CONFIG_CONTENT") or build_config_content(REPO_ROOT / "opencode" / "agents" / "hunt-auto.md", plan=args.plan)
+    config = os.environ.get("RUNNER_CONFIG_CONTENT")
+    if config is None and runtime != "omp":
+        config = build_config_content(REPO_ROOT / "opencode" / "agents" / "hunt-auto.md", plan=args.plan)
     ctx = {
         "repo": repo, "hyp": None, "brief": "", "config": config, "owner": owner,
         "model": args.model, "budget": budget, "started_ts": hx.now(),
         "no_adjudicate": args.no_adjudicate, "plan_n": args.plan_n,
-        "netns": args.netns,
+        "netns": args.netns, "runtime": runtime, "plan": args.plan,
     }
     try:
         write_pid(repo)
         install_signals(ctx)
         if args.plan:
-            run_plan(ctx)
-            return 0
+            record = run_plan(ctx)
+            return 0 if record.get("rc") in (0, 124) else 1
         runner_state_init(repo)
         if args.netns or args.workers > 1:
             reasons = run_workers(ctx, max(args.workers, 1))

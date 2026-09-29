@@ -26,7 +26,7 @@ class SliceTest(unittest.TestCase):
         self.orig_adjudicate = runner.adjudicate
         self.orig_run = runner.subprocess.run
         runner.invoke_opencode = lambda prompt, cwd, config_content, timeout_s, model=None, **kwargs: (0, '{"sessionID":"ses_test"}\n', "")
-        runner.export_usage = lambda hx_mod, session_id: {"tokens": 123, "cost": 0.01}
+        runner.export_usage = lambda hx_mod, session_ref, runtime="opencode": {"tokens": 123, "cost": 0.01}
 
     def tearDown(self):
         runner.invoke_opencode = self.orig_invoke
@@ -251,11 +251,14 @@ class InvokeEnvTest(unittest.TestCase):
 
     def fake(self, calls):
         class FakeProc:
+            pid = 4194304
             def __init__(self, argv, **kwargs):
                 calls.append(kwargs)
                 self.returncode = 0
             def communicate(self, timeout=None):
                 return ("", "")
+            def wait(self, timeout=None):
+                return 0
         return FakeProc
 
     def test_env_extra_merges_after_config_content(self):
@@ -349,8 +352,9 @@ class RetryTest(unittest.TestCase):
             self.calls.append(kwargs)
             return results.pop(0)
         runner.invoke_opencode = fake
-        rc, stdout, stderr, attempts = runner.retry_invoke(self.make_ctx(), "p")
+        rc, stdout, stderr, attempts, sessions = runner.retry_invoke(self.make_ctx(), "p")
         self.assertEqual((rc, attempts), (0, 3))
+        self.assertEqual(sessions, ["ses_x"])
         self.assertEqual(self.sleeps, [5, 10])
 
     def test_rate_failure_uses_rate_backoff(self):
@@ -375,7 +379,7 @@ class RetryTest(unittest.TestCase):
         def fake(prompt, cwd, config_content, timeout_s, model=None, **kwargs):
             return results.pop(0)
         runner.invoke_opencode = fake
-        rc, stdout, stderr, attempts = runner.retry_invoke(self.make_ctx(), "p")
+        rc, stdout, stderr, attempts, sessions = runner.retry_invoke(self.make_ctx(), "p")
         self.assertEqual((rc, attempts), (1, 3))
         self.assertEqual(self.sleeps, [5, 10])
 
@@ -394,7 +398,7 @@ class RetryTest(unittest.TestCase):
     def test_stop_file_breaks_between_attempts(self):
         runner.request_stop(self.repo)
         runner.invoke_opencode = lambda *a, **kw: (1, "", "boom")
-        rc, stdout, stderr, attempts = runner.retry_invoke(self.make_ctx(), "p")
+        rc, stdout, stderr, attempts, sessions = runner.retry_invoke(self.make_ctx(), "p")
         self.assertEqual(attempts, 1)
         self.assertEqual(self.sleeps, [5])
 
@@ -402,13 +406,13 @@ class RetryTest(unittest.TestCase):
         runner.invoke_opencode = lambda *a, **kw: (1, "", "boom")
         ctx = self.make_ctx()
         ctx["budget"] = {**runner.DEFAULTS, "wall_s": 0}
-        rc, stdout, stderr, attempts = runner.retry_invoke(ctx, "p")
+        rc, stdout, stderr, attempts, sessions = runner.retry_invoke(ctx, "p")
         self.assertEqual(attempts, 1)
         self.assertEqual(self.sleeps, [5])
 
     def test_timeout_not_retried(self):
         runner.invoke_opencode = lambda *a, **kw: (124, "", "timeout")
-        rc, stdout, stderr, attempts = runner.retry_invoke(self.make_ctx(), "p")
+        rc, stdout, stderr, attempts, sessions = runner.retry_invoke(self.make_ctx(), "p")
         self.assertEqual((rc, attempts), (124, 1))
         self.assertEqual(self.sleeps, [])
 
@@ -508,8 +512,9 @@ class SliceCeilingTest(unittest.TestCase):
         runner.os.killpg = lambda pid, sig: killed.append((pid, sig))
         rc, out, err = runner.invoke_opencode("p", "/tmp", "{}", 30)
         self.assertEqual(rc, 124)
-        self.assertEqual(killed, [(4321, runner.signal.SIGKILL)])
+        self.assertEqual(set(killed), {(4321, runner.signal.SIGKILL)})
         self.assertEqual(out, "partial")
+        self.assertEqual(runner._INFLIGHT, {})
 
     def test_timeout_survives_lookup_error_and_stuck_communicate(self):
         timeouts = []
@@ -1177,7 +1182,7 @@ class NetnsRulesTest(unittest.TestCase):
     def test_agent_argv_wraps_only_under_netns(self):
         os.environ["HX_NETNS"] = "1"
         try:
-            self.assertEqual(runner.agent_argv(["opencode", "run"]), ["setpriv", "--bounding-set=-net_admin", "--", "opencode", "run"])
+            self.assertEqual(runner.agent_argv(["opencode", "run"]), ["setpriv", "--bounding-set=-net_admin,-net_raw", "--", "opencode", "run"])
         finally:
             os.environ.pop("HX_NETNS", None)
         self.assertEqual(runner.agent_argv(["opencode", "run"]), ["opencode", "run"])
@@ -1262,7 +1267,7 @@ class NetnsWorkerTest(unittest.TestCase):
             def send(self, value): calls["enter"] += 1
             def recv(self): return "go"
         runner.os.unshare = lambda flags: calls["unshare"].append(flags)
-        runner.netns_allow_hosts = lambda repo, hyp=None: {"alvo.com"}
+        runner.netns_allow_hosts = lambda repo, hyp=None, runtime="opencode": {"alvo.com"}
         runner.resolve_ips = lambda hosts: {"1.2.3.4"}
         runner.apply_netns_rules = lambda ips, resolvers: calls.__setitem__("rules", calls["rules"] + 1)
         try:
@@ -1281,7 +1286,7 @@ class NetnsWorkerTest(unittest.TestCase):
         orig_allow = runner.netns_allow_hosts
         orig_apply = runner.apply_netns_rules
         orig_resolve = runner.resolve_ips
-        runner.netns_allow_hosts = lambda repo, hyp=None: {"alvo.com"}
+        runner.netns_allow_hosts = lambda repo, hyp=None, runtime="opencode": {"alvo.com"}
         runner.resolve_ips = lambda hosts: {"9.9.9.9"}
         runner.apply_netns_rules = lambda ips, resolvers: seen.append(sorted(ips))
         try:
@@ -1491,25 +1496,409 @@ class NetnsWorkerTest(unittest.TestCase):
             runner.os.read = orig_read
             runner.select.select = orig_select
 
-    def test_worker_entry_resets_sigterm(self):
-        orig = runner.signal.getsignal(runner.signal.SIGTERM)
+    def test_worker_entry_installs_cleanup_handlers(self):
+        orig_term = runner.signal.getsignal(runner.signal.SIGTERM)
+        orig_int = runner.signal.getsignal(runner.signal.SIGINT)
         orig_loop = runner.worker_loop
         class Q:
             def put(self, value): pass
-        runner.signal.signal(runner.signal.SIGTERM, lambda *args: None)
         runner.worker_loop = lambda ctx: "empty_queue"
         try:
             runner.worker_entry(Q(), {"repo": self.repo})
-            self.assertEqual(runner.signal.getsignal(runner.signal.SIGTERM), runner.signal.SIG_DFL)
+            self.assertEqual(runner.signal.getsignal(runner.signal.SIGTERM), runner._stop_signal)
+            self.assertEqual(runner.signal.getsignal(runner.signal.SIGINT), runner._stop_signal)
         finally:
             runner.worker_loop = orig_loop
-            runner.signal.signal(runner.signal.SIGTERM, orig)
+            runner.signal.signal(runner.signal.SIGTERM, orig_term)
+            runner.signal.signal(runner.signal.SIGINT, orig_int)
+
+    def test_stop_request_kills_inflight_and_sets_latch(self):
+        killed = []
+        orig_killpg = runner.os.killpg
+        runner.os.killpg = lambda pid, sig: killed.append(pid)
+        runner._INFLIGHT[4243] = object()
+        try:
+            runner.install_signals({"repo": self.repo})
+            runner.signal.getsignal(runner.signal.SIGINT)(runner.signal.SIGINT, None)
+            self.assertTrue((self.repo.hunt / "runner.stop").exists())
+            self.assertEqual(killed, [4243])
+        finally:
+            runner._INFLIGHT.pop(4243, None)
+            runner.os.killpg = orig_killpg
+            runner.signal.signal(runner.signal.SIGINT, runner.signal.SIG_DFL)
+            runner.signal.signal(runner.signal.SIGTERM, runner.signal.SIG_DFL)
+
+    def test_stop_signal_kills_inflight_group(self):
+        killed = []
+        orig_killpg = runner.os.killpg
+        orig_exit = runner.os._exit
+        runner.os.killpg = lambda pid, sig: killed.append((pid, sig))
+        runner.os._exit = lambda code: killed.append(("exit", code))
+        runner._INFLIGHT[4242] = object()
+        try:
+            runner._stop_signal(runner.signal.SIGTERM, None)
+            self.assertEqual(killed, [(4242, runner.signal.SIGKILL), ("exit", 143)])
+        finally:
+            runner._INFLIGHT.pop(4242, None)
+            runner.os.killpg = orig_killpg
+            runner.os._exit = orig_exit
+
+    def test_invoke_opencode_reaps_group_after_return(self):
+        killed = []
+        orig_killpg = runner.os.killpg
+        orig_popen = runner.subprocess.Popen
+        class Proc:
+            pid = 4194305
+            returncode = 0
+            def communicate(self, timeout=None):
+                return ("out", "")
+            def wait(self, timeout=None):
+                return 0
+        runner.os.killpg = lambda pid, sig: killed.append(pid)
+        runner.subprocess.Popen = lambda argv, **kwargs: Proc()
+        try:
+            self.assertEqual(runner.invoke_opencode("p", "/tmp", "{}", 30), (0, "out", ""))
+            self.assertEqual(killed, [4194305])
+            self.assertEqual(runner._INFLIGHT, {})
+        finally:
+            runner.os.killpg = orig_killpg
+            runner.subprocess.Popen = orig_popen
+
+
+class RunnerNewGuardsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.eng = Path(self.tmp.name)
+        runner.hx.main(["init", "--dir", str(self.eng)])
+        os.environ["HX_ENGAGEMENT"] = str(self.eng)
+        os.environ["HX_SESSION"] = "runner-test"
+        self.repo = runner.hx.Repo(self.eng)
+        self.orig_invoke = runner.invoke_opencode
+        self.orig_export = runner.export_usage
+        runner.invoke_opencode = lambda *a, **kw: (0, '{"sessionID":"ses_a"}\n', "")
+        runner.export_usage = lambda hx_mod, ref, runtime="opencode": {"tokens": 10, "cost": 0.01}
+
+    def tearDown(self):
+        runner.invoke_opencode = self.orig_invoke
+        runner.export_usage = self.orig_export
+        for key in ("HX_ENGAGEMENT", "HX_SESSION", "HX_FAKE_NOW"):
+            os.environ.pop(key, None)
+        self.tmp.cleanup()
+
+    def add(self, claim="c", endpoint="GET /a"):
+        runner.hx.main(["hypothesis", "add", "--claim", claim, "--endpoint", endpoint, "--class", "BOLA", "--confirm", "x", "--refute", "y"])
+
+    def test_endpoint_host_outside_scope_is_not_whitelisted(self):
+        scope_path = self.repo.hunt / "scope.json"
+        scope = json.loads(scope_path.read_text())
+        scope["in_scope"] = ["acme.com"]
+        scope["netns"] = {"allow_hosts": ["backend.internal"]}
+        scope_path.write_text(json.dumps(scope))
+        hyp = {"endpoint": "GET https://exfil.evil.tld/x?next=acme.com"}
+        hosts = runner.netns_allow_hosts(self.repo, hyp, config_dir=Path("/nonexistent"), models_cache=Path("/nonexistent"), auth_file=Path("/nonexistent"))
+        self.assertNotIn("exfil.evil.tld", hosts)
+        self.assertIn("backend.internal", hosts)
+
+    def test_plan_failure_exit_code(self):
+        runner.invoke_opencode = lambda *a, **kw: (1, "", "provider down")
+        self.assertEqual(runner.runner_main(["--engagement", str(self.eng), "--plan"]), 1)
+
+    def test_rejects_nonpositive_caps(self):
+        self.assertEqual(runner.runner_main(["--engagement", str(self.eng), "--slices", "-1"]), 2)
+        self.assertEqual(runner.runner_main(["--engagement", str(self.eng), "--max-tokens", "0"]), 2)
+        self.assertEqual(runner.runner_main(["--engagement", str(self.eng), "--wall", "0"]), 2)
+
+    def test_concurrent_runner_lock_refused(self):
+        lock = runner.acquire_runner_lock(self.repo)
+        try:
+            self.assertIsNotNone(lock)
+            self.assertIsNone(runner.acquire_runner_lock(self.repo))
+        finally:
+            lock.close()
+
+    def test_invoke_opencode_kills_only_its_own_group(self):
+        sibling = subprocess.Popen(["sleep", "20"])
+        real_invoke = self.orig_invoke
+        orig_argv = runner.agent_argv
+        runner.invoke_opencode = real_invoke
+        runner.agent_argv = lambda argv: ["sh", "-c", "sleep 20", "--"]
+        try:
+            rc, out, err = real_invoke("p", "/tmp", "{}", 1)
+        finally:
+            runner.agent_argv = orig_argv
+            runner.invoke_opencode = self.orig_invoke
+        try:
+            self.assertEqual(rc, 124)
+            self.assertIsNone(sibling.poll())
+        finally:
+            sibling.kill()
+            sibling.wait(timeout=5)
+
+    def test_dead_session_releases_slice(self):
+        scope_path = self.repo.hunt / "scope.json"
+        scope = json.loads(scope_path.read_text())
+        scope["in_scope"] = ["acme.com"]
+        scope["health"] = {"probes": [{"session": "s1", "file": "recon/session_s1.json", "method": "GET", "url": "https://acme.com/whoami"}], "session_invalid_if": ["status:401"]}
+        scope_path.write_text(json.dumps(scope))
+        runner.hx.dump_json(self.repo.hunt / ".health.json", {"s1": {"strikes": 2, "first_strike": 1.0, "dead_since": 1.0, "suspect_since": None, "probes": []}})
+        for claim in ("a", "b"):
+            runner.hx.main(["hypothesis", "add", "--claim", claim, "--endpoint", "GET /x", "--class", "BOLA", "--confirm", "x", "--refute", "y", "--session-tag", "s1"])
+        runner.runner_state_init(self.repo)
+        ctx = {"repo": self.repo, "budget": dict(runner.DEFAULTS), "owner": "s1", "config": "{}", "worker": "s1", "slice_timeout_s": 900, "started_ts": runner.hx.now()}
+        self.assertEqual(runner.worker_loop(ctx), "empty_queue")
+        self.assertEqual(runner.runner_state_read(self.repo)["slices"], 0)
+        verdicts = [hyp["result"]["verdict"] for hyp in runner.hx.load_hyps(self.repo)[0]]
+        self.assertEqual(verdicts, ["blocked", "blocked"])
+
+
+class OmpRuntimeTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.eng = Path(self.tmp.name)
+        runner.hx.main(["init", "--dir", str(self.eng)])
+        os.environ["HX_ENGAGEMENT"] = str(self.eng)
+        os.environ["HX_SESSION"] = "runner-test"
+        self.repo = runner.hx.Repo(self.eng)
+        self.orig_popen = runner.subprocess.Popen
+        self.orig_invoke_omp = runner.invoke_omp
+        self.orig_invoke_opencode = runner.invoke_opencode
+        self.orig_invoke_agent = runner.invoke_agent
+        self.orig_retry_invoke = runner.retry_invoke
+        self.orig_adjudicate = runner.adjudicate
+        self.orig_sleep = runner.hx.sleep
+        self.orig_which = shutil.which
+
+    def tearDown(self):
+        runner.subprocess.Popen = self.orig_popen
+        runner.invoke_omp = self.orig_invoke_omp
+        runner.invoke_opencode = self.orig_invoke_opencode
+        runner.invoke_agent = self.orig_invoke_agent
+        runner.retry_invoke = self.orig_retry_invoke
+        runner.adjudicate = self.orig_adjudicate
+        runner.hx.sleep = self.orig_sleep
+        shutil.which = self.orig_which
+        for key in ("HX_ENGAGEMENT", "HX_SESSION", "HX_OMP_BASH_MODE", "PI_CODING_AGENT_DIR"):
+            os.environ.pop(key, None)
+        self.tmp.cleanup()
+
+    def fake_popen(self, argv):
+        class Proc:
+            pid = 4194306
+            returncode = 0
+            def __init__(self):
+                argv.append(None)
+            def communicate(self, timeout=None):
+                return ("", "")
+            def wait(self, timeout=None):
+                return 0
+        return Proc
+
+    def test_detect_runtime_prefers_explicit_then_path(self):
+        self.assertEqual(runner.detect_runtime("omp"), "omp")
+        self.assertEqual(runner.detect_runtime("opencode"), "opencode")
+        shutil.which = lambda name: "/usr/bin/omp" if name == "omp" else None
+        self.assertEqual(runner.detect_runtime(), "omp")
+        shutil.which = lambda name: "/usr/bin/opencode" if name == "opencode" else None
+        self.assertEqual(runner.detect_runtime(), "opencode")
+        shutil.which = lambda name: None
+        with self.assertRaises(runner.hx.HxError):
+            runner.detect_runtime()
+
+    def test_omp_argv_is_headless_and_tripwired(self):
+        argv = runner.omp_argv(self.eng, "trabalhe h001", "smol-model", "ses_1", 900, plan=False)
+        self.assertEqual(argv[0], "omp")
+        self.assertIn("--print", argv)
+        self.assertIn("--auto-approve", argv)
+        self.assertIn("--no-title", argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "smol-model")
+        self.assertEqual(argv[argv.index("--resume") + 1], "ses_1")
+        self.assertEqual(argv[argv.index("--session-dir") + 1], str(self.eng / "hunt" / ".omp-sessions"))
+        self.assertEqual(argv[argv.index("--hook") + 1], str(runner.OMP_GUARD_HOOK))
+        self.assertEqual(argv[argv.index("--max-time") + 1], "900")
+        self.assertEqual(argv[-2:], ["--", "trabalhe h001"])
+
+    def test_invoke_omp_sets_bash_mode_and_spawns_headless(self):
+        seen = {}
+        def fake_popen(argv, **kwargs):
+            seen["argv"] = argv
+            seen["env"] = kwargs["env"]
+            seen["session"] = kwargs["start_new_session"]
+            class Proc:
+                pid = 4194307
+                returncode = 0
+                def communicate(self, timeout=None):
+                    return ("out", "")
+                def wait(self, timeout=None):
+                    return 0
+            return Proc()
+        runner.subprocess.Popen = fake_popen
+        rc, out, err = runner.invoke_omp("p", self.eng, 30, env_extra={"HX_SESSION": "s1"}, plan=True)
+        self.assertEqual((rc, out, err), (0, "out", ""))
+        self.assertEqual(seen["env"]["HX_OMP_BASH_MODE"], "plan")
+        self.assertEqual(seen["env"]["HX_SESSION"], "s1")
+        self.assertEqual(seen["argv"][0], "omp")
+        self.assertTrue(seen["session"])
+
+    def test_invoke_agent_dispatches_by_runtime(self):
+        calls = []
+        runner.invoke_omp = lambda *a, **kw: calls.append(("omp", a[1], a[6])) or (0, "", "")
+        runner.invoke_opencode = lambda *a, **kw: calls.append(("opencode", a[1], None)) or (0, "", "")
+        base = {"repo": self.repo, "slice_timeout_s": 30, "config": "{}"}
+        runner.invoke_agent({**base, "runtime": "omp", "plan": True}, "p")
+        runner.invoke_agent({**base, "runtime": "opencode"}, "p")
+        runner.invoke_agent(base, "p")
+        self.assertEqual(calls[0][0], "omp")
+        self.assertTrue(calls[0][2])
+        self.assertEqual([call[0] for call in calls[1:]], ["opencode", "opencode"])
+
+    def write_session(self, sid="01a0d3c3-3ade-702a-ac5f-c7119b761137", tokens=(100, 23), cost=(0.01, 0.02), sub=False, flat=False, slice_name=None):
+        root = self.eng / "hunt" / ".omp-sessions"
+        if slice_name:
+            root = root / slice_name
+        elif not flat:
+            root = root / "--eng--"
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"2026-09-24T14-13-02-302Z_{sid}.jsonl"
+        lines = [json.dumps({"type": "session", "version": 3, "id": sid, "cwd": str(self.eng)})]
+        for total, money in zip(tokens, cost):
+            lines.append(json.dumps({"type": "model_usage", "usage": {"totalTokens": total, "cost": {"total": money}}}))
+        path.write_text("\n".join(lines) + "\n")
+        if sub:
+            nested = root / f"2026-09-24T14-13-02-302Z_{sid}"
+            nested.mkdir(exist_ok=True)
+            (nested / "SubAgent.jsonl").write_text("{}\n")
+        return path
+
+    def test_omp_session_id_and_usage(self):
+        path = self.write_session(sub=True)
+        self.assertEqual(runner.omp_session_id(path), "01a0d3c3-3ade-702a-ac5f-c7119b761137")
+        self.assertEqual(runner.omp_session_usage(path), {"tokens": 123, "cost": 0.03})
+        files = runner.omp_session_files(self.eng)
+        self.assertEqual(len(files), 1)
+        self.assertNotIn("SubAgent", str(next(iter(files))))
+
+    def test_omp_session_files_handles_flat_and_nested_layouts(self):
+        flat = self.write_session(sid="01a0d3c3-3ade-702a-ac5f-111111111111", flat=True)
+        nested = self.write_session(sid="01a0d3c3-3ade-702a-ac5f-222222222222")
+        artifacts = self.eng / "hunt" / ".omp-sessions" / "2026-09-24T14-13-02-302Z_01a0d3c3-3ade-702a-ac5f-222222222222"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "__advisor.muse.jsonl").write_text(json.dumps({"type": "session", "id": "advisor"}) + "\n")
+        files = {str(path) for path in runner.omp_session_files(self.eng)}
+        self.assertEqual(files, {str(flat), str(nested)})
+        self.assertIsNone(runner.OMP_SESSION_NAME_RE.match("__advisor.muse.jsonl"))
+        self.assertIsNone(runner.OMP_SESSION_NAME_RE.match("SubAgent.jsonl"))
+
+    def test_omp_sessions_are_isolated_per_slice(self):
+        first = self.write_session(sid="01a0d3c3-3ade-702a-ac5f-333333333333", slice_name="h001-1-1")
+        second = self.write_session(sid="01a0d3c3-3ade-702a-ac5f-444444444444", slice_name="h002-2-2")
+        self.assertEqual({str(path) for path in runner.omp_session_files(self.eng, "h001-1-1")}, {str(first)})
+        self.assertEqual({str(path) for path in runner.omp_session_files(self.eng, "h002-2-2")}, {str(second)})
+        self.assertEqual(len(runner.omp_session_files(self.eng)), 2)
+        argv = runner.omp_argv(self.eng, "p", None, None, 60, plan=False, session_dir="h002-2-2")
+        self.assertEqual(argv[argv.index("--session-dir") + 1], str(self.eng / "hunt" / ".omp-sessions" / "h002-2-2"))
+
+    def test_retry_invoke_ignores_other_slices_sessions(self):
+        seen = []
+        def fake_invoke(ctx, prompt, resume_session=None):
+            self.write_session(sid="01a0d3c3-3ade-702a-ac5f-555555555555", slice_name="outra-fatia")
+            seen.append(resume_session)
+            return (1, "", "boom")
+        runner.invoke_agent = fake_invoke
+        runner.hx.sleep = lambda seconds: None
+        ctx = {"repo": self.repo, "runtime": "omp", "session_dir": "minha-fatia", "budget": {**runner.DEFAULTS, "backoff_attempts": 2}, "owner": "s1", "started_ts": runner.hx.now()}
+        rc, stdout, stderr, attempts, sessions = runner.retry_invoke(ctx, "p")
+        self.assertEqual((rc, attempts), (1, 2))
+        self.assertEqual(sessions, [])
+        self.assertEqual(seen, [None, None])
+
+    def test_omp_session_refs_are_json_serializable(self):
+        def fake_invoke(ctx, prompt, resume_session=None):
+            self.write_session(slice_name=ctx.get("session_dir") or "x")
+            return (0, "", "")
+        runner.invoke_agent = fake_invoke
+        ctx = {"repo": self.repo, "runtime": "omp", "session_dir": "fatia-x", "budget": {**runner.DEFAULTS, "backoff_attempts": 1}, "owner": "s1", "started_ts": runner.hx.now()}
+        rc, stdout, stderr, attempts, sessions = runner.retry_invoke(ctx, "p")
+        self.assertEqual(rc, 0)
+        self.assertTrue(sessions)
+        self.assertTrue(all(isinstance(ref, str) for ref in sessions))
+        json.dumps({"sessions": sessions})
+
+    def test_export_usage_dispatches_to_session_file(self):
+        path = self.write_session()
+        self.assertEqual(runner.export_usage(runner.hx, str(path), "omp"), {"tokens": 123, "cost": 0.03})
+        self.assertEqual(runner.export_usage(runner.hx, None, "omp"), {})
+
+    def test_omp_egress_hosts_reads_agent_config(self):
+        agent_dir = Path(self.tmp.name) / "agent"
+        agent_dir.mkdir()
+        (agent_dir / "models.yml").write_text("providers:\n  local:\n    baseUrl: https://gateway.internal:8443/v1\n")
+        (agent_dir / "config.yml").write_text("modelRoles:\n  default: acme/gpt\n")
+        os.environ["PI_CODING_AGENT_DIR"] = str(agent_dir)
+        self.assertEqual(runner.omp_egress_hosts(), {"gateway.internal"})
+
+    def test_netns_allowlist_uses_omp_provider_hosts(self):
+        agent_dir = Path(self.tmp.name) / "agent2"
+        agent_dir.mkdir()
+        (agent_dir / "models.yml").write_text("providers:\n  local:\n    baseUrl: https://gateway.internal/v1\n")
+        os.environ["PI_CODING_AGENT_DIR"] = str(agent_dir)
+        scope_path = self.repo.hunt / "scope.json"
+        scope = json.loads(scope_path.read_text())
+        scope["in_scope"] = ["acme.com"]
+        scope["netns"] = {"allow_hosts": []}
+        scope_path.write_text(json.dumps(scope))
+        hosts = runner.netns_allow_hosts(self.repo, {"endpoint": "GET https://exfil.evil.tld/x"}, runtime="omp")
+        self.assertIn("gateway.internal", hosts)
+        self.assertIn("acme.com", hosts)
+        self.assertNotIn("exfil.evil.tld", hosts)
+
+    def test_netns_without_derivable_omp_provider_fails_closed(self):
+        scope_path = self.repo.hunt / "scope.json"
+        scope = json.loads(scope_path.read_text())
+        scope["in_scope"] = ["acme.com"]
+        scope["netns"] = {"allow_hosts": []}
+        scope_path.write_text(json.dumps(scope))
+        os.environ["PI_CODING_AGENT_DIR"] = str(Path(self.tmp.name) / "vazio")
+        self.assertEqual(runner.omp_egress_hosts(), set())
+        with self.assertRaises(runner.hx.HxError):
+            runner.netns_allow_hosts(self.repo, runtime="omp")
+        scope["netns"] = {"allow_hosts": ["gateway.internal"]}
+        scope_path.write_text(json.dumps(scope))
+        self.assertIn("gateway.internal", runner.netns_allow_hosts(self.repo, runtime="omp"))
+
+    def test_retry_invoke_tracks_omp_sessions_and_resumes(self):
+        resumed = []
+        def fake_invoke(ctx, prompt, resume_session=None):
+            resumed.append(resume_session)
+            self.write_session(sid=f"01a0d3c3-3ade-702a-ac5f-00000000000{len(resumed)}", sub=False)
+            return (1, "", "boom") if len(resumed) == 1 else (0, "", "")
+        runner.invoke_agent = fake_invoke
+        runner.hx.sleep = lambda seconds: None
+        ctx = {"repo": self.repo, "runtime": "omp", "budget": {**runner.DEFAULTS, "backoff_attempts": 2}, "owner": "s1", "started_ts": runner.hx.now()}
+        rc, stdout, stderr, attempts, sessions = runner.retry_invoke(ctx, "p")
+        self.assertEqual((rc, attempts), (0, 2))
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(resumed, [None, "01a0d3c3-3ade-702a-ac5f-000000000001"])
+
+    def test_run_slice_records_omp_tokens(self):
+        def fake_retry(ctx, prompt):
+            path = self.write_session(slice_name=ctx["session_dir"])
+            return 0, "", "", 1, [str(path)]
+        runner.retry_invoke = fake_retry
+        runner.adjudicate = lambda repo, hid: {"ran": False}
+        runner.hx.main(["hypothesis", "add", "--claim", "c", "--endpoint", "GET /a", "--class", "BOLA", "--confirm", "x", "--refute", "y"])
+        hyps, _ = runner.hx.load_hyps(self.repo)
+        ctx = {"repo": self.repo, "runtime": "omp", "hyp": hyps[0], "config": "{}", "budget": dict(runner.DEFAULTS), "started_ts": runner.hx.now()}
+        record = runner.run_slice(ctx)
+        self.assertTrue(record["omp_session_dir"].startswith("h001-"))
+        self.assertEqual(record["tokens"], 123)
+        self.assertEqual(record["cost"], 0.03)
+        self.assertEqual(record["session"], "01a0d3c3-3ade-702a-ac5f-c7119b761137")
 
 
 class NetnsSelfcheckTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("slirp4netns") and shutil.which("nft") and shutil.which("setpriv"), "backend netns ausente")
     def test_selfcheck_real(self):
-        proc = subprocess.run(["unshare", "-Ur", sys.executable, str(RUNNER), "--netns-selfcheck"], capture_output=True, text=True, timeout=180)
+        proc = subprocess.run([sys.executable, str(RUNNER), "--netns-selfcheck"], capture_output=True, text=True, timeout=180)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("SELFCHECK OK", proc.stdout)
 
