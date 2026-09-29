@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .superpowers/
 .worktrees/
+recon/session_*.json
+scans/
+hunt/
