@@ -4,12 +4,9 @@
 
 - Work order é claim, não pergunta: "confirme ou refute isto" — nunca "procure problemas".
 - Toda saída de rede passa por `hx run`. Mutação fora de `allowed_mutations` é estagiada (exit 5) e executada só pelo dj (`hx pending list/show/run/drop`; item com mais de 7 dias aparece `[stale]`).
-- `hunt/scope.json` é do dj: o agente não escreve nele (o plugin recusa `edit`/`write`). Escopo novo → peça ao dj e re-rode.
-- Claim tem dono: a sessão é `HX_SESSION`, senão o TTY, senão o PID. Fechar claim de outra sessão exige `--force` — não use `--force` para contornar isso.
-- `out_of_scope_paths` é comparado com o path normalizado (decodifica `%xx`, resolve `.`/`..` e barras repetidas): `//admin`, `/x/../admin` e `/%61dmin` batem no mesmo banido.
 - Refutação por auth-failure exige sessão viva (o `hx result` dispara o probe on-demand).
 - Achado só entra em FINDINGS/ via `hx verify` (cenário PASS) ou `hx verify --attest` (TTY, dj).
-- Evidência redigida na captura; segredos nunca em claro em disco — exceto o marcador que o próprio operador extrai via `--marker` (bloco isento por desenho).
+- Evidência redigida na captura; segredos nunca em claro em disco.
 - Jev (ligado por padrao; desligue com scope.json -> jev.enabled false; requer TYPESAFE_API_KEY): health semantico, dedup no hypothesis add, prioridade da fila e segunda opiniao no verify; egress so de texto redigido; com Jev ligado e sem veredito, a promocao exige --attest.
 
 ## Início de sessão
@@ -22,7 +19,7 @@
 ## Durante
 
 - Hipótese nova → `hx hypothesis add ...`.
-- Sessão suspeita → `hx health check --session <tag>` (exige `health.probes` no scope.json; sem probe o comando recusa em vez de sair vazio).
+- Sessão suspeita → `hx health check --session <tag>`.
 - Probes contam no rate; nada de "tráfego de sistema".
 - `waf_block_if` marcado → cooldown do host (30→60→120min, dobra a cada reincidência); retomada manual: `hx rate reset`.
 
@@ -30,7 +27,7 @@
 
 - **differential** — vítima/atacante/controle com sessões próprias; PASS automático com marcador longo; marcador curto (< 6) exige `--attest`.
 - **echo** — param refletidor: `payload_template` sempre com `{CANARY}`; reflita cru via `{payload}` (percent-encoded) ou `{payload_raw}` na URL; **sempre exige `--attest`** (prova contextual).
-- **callback** — BYO webhook.site: crie a URL no browser e cole `collaborator.url` + `collaborator.poll.url` no draft antes do verify. O host do poll precisa estar registrado em `in_scope`/`allow_extra_hosts` (o draft não autoriza egress) e entra no rate como qualquer outro egress. Timeout **não** refuta — feche com `blocked` ou `unverified`.
+- **callback** — BYO webhook.site: crie a URL no browser e cole `collaborator.url` + `collaborator.poll.url` no draft antes do verify. Timeout **não** refuta — feche com `blocked` ou `unverified`.
 
 ## Fim de sessão (/debrief)
 
@@ -40,8 +37,7 @@
 
 ## Runner (opt-in)
 
-- Comando: `python3 runner/runner.py --engagement . --slices N --wall SEGUNDOS` (a partir do checkout do huntx) — 1 worker sequencial; spawna o agente headless e adjudica o draft (se houver) com `hx verify`.
-- Runtime: `--runtime opencode` (default) ou `--runtime omp`; sem flag, usa `opencode` se estiver no PATH, senão `omp`. No `omp` a fatia roda com `omp --print` e o tripwire é o hook `runner/omp/guard-hook.ts` (só `hx *`, sem substituição nem encadeamento; no planner, só `hx hypothesis add`); as sessões ficam em `hunt/.omp-sessions/` e o tokens/custo vem das entradas `model_usage` delas.
+- Comando: `python3 runner/runner.py --engagement . --slices N --wall SEGUNDOS` (a partir do checkout do huntx) — 1 worker sequencial; spawna `opencode run` headless com o agente `hunt-auto` injetado inline e adjudica o draft (se houver) com `hx verify`.
 - Cada fatia vira um record em `hunt/runs.jsonl`.
 - Paradas: fila vazia, `--slices`/`--wall`/caps (`--max-tokens`, `--max-cost`) esgotados ou `runner.stop` presente.
 - Sessão morta (só com probes no scope e `session_tag` na hipótese): a hipótese fecha `blocked` e o runner segue.
