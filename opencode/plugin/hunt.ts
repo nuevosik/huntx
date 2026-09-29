@@ -3,6 +3,24 @@ import { decideBash, decideUrl, extractHosts, hostAllowed } from "./lib/guard.js
 import { appendFileSync, existsSync, readFileSync } from "node:fs"
 import { join, resolve } from "node:path"
 
+type Scope = Record<string, unknown> & {
+  in_scope?: string[]
+  out_of_scope_hosts?: string[]
+  allow_extra_hosts?: string[]
+}
+
+const AGENT_SESSION = `oc-${process.pid}-${Math.floor(Date.now() / 1000)}`
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null
+}
+
+function text(value: unknown, key: string): string {
+  const holder = record(value)
+  const raw = holder ? holder[key] : undefined
+  return typeof raw === "string" ? raw : ""
+}
+
 function engagementDir(): string | null {
   let dir = resolve(process.cwd())
   for (;;) {
@@ -13,9 +31,9 @@ function engagementDir(): string | null {
   }
 }
 
-function scopeOf(dir: string): any | null {
+function scopeOf(dir: string): Scope | null {
   try {
-    return JSON.parse(readFileSync(join(dir, "hunt", "scope.json"), "utf8"))
+    return JSON.parse(readFileSync(join(dir, "hunt", "scope.json"), "utf8")) as Scope
   } catch {
     return null
   }
@@ -28,35 +46,42 @@ function audit(dir: string, tool: string, argsDigest: string, verdict: string, r
   } catch {}
 }
 
+const SCOPE_MUTATORS = ["edit", "write", "patch", "multiedit"]
+
 export default (async ({ $ }) => {
   return {
-    "experimental.chat.system.transform": async (_input: any, output: any) => {
+    "experimental.chat.system.transform": async (_input: unknown, output: unknown) => {
       const dir = engagementDir()
       if (!dir) return
       try {
         const brief = await $`hx brief --max-bytes 4000`.cwd(dir).text()
-        if (typeof output?.system === "string") {
-          output.system = output.system + "\n\n" + brief
-        } else if (Array.isArray(output?.system)) {
-          output.system.push(brief)
+        const holder = record(output)
+        if (!holder) return
+        if (typeof holder.system === "string") {
+          holder.system = holder.system + "\n\n" + brief
+        } else if (Array.isArray(holder.system)) {
+          holder.system.push(brief)
         }
       } catch (err) {
         audit(dir, "brief", "hx brief", "error", String(err))
       }
     },
-    "shell.env": async (_input: any, output: any) => {
+    "shell.env": async (_input: unknown, output: unknown) => {
       const dir = engagementDir()
       if (!dir) return
       try {
-        output.env.HTTP_PROXY = "http://127.0.0.1:8899"
-        output.env.HTTPS_PROXY = "http://127.0.0.1:8899"
-        output.env.ALL_PROXY = "http://127.0.0.1:8899"
-        output.env.NO_PROXY = "localhost,127.0.0.1"
+        const env = record(record(output)?.env)
+        if (!env) return
+        env.HX_SESSION = AGENT_SESSION
+        env.HTTP_PROXY = "http://127.0.0.1:8899"
+        env.HTTPS_PROXY = "http://127.0.0.1:8899"
+        env.ALL_PROXY = "http://127.0.0.1:8899"
+        env.NO_PROXY = "localhost,127.0.0.1,::1"
       } catch (err) {
         audit(dir, "shell.env", "proxy vars", "error", String(err))
       }
     },
-    "tool.execute.before": async (input: any, output: any) => {
+    "tool.execute.before": async (input: unknown, output: unknown) => {
       const dir = engagementDir()
       if (!dir) return
       const scope = scopeOf(dir)
@@ -64,21 +89,28 @@ export default (async ({ $ }) => {
         audit(dir, "tripwire", "scope.json", "block", "scope ilegivel — rede bloqueada")
         throw new Error("hunt/ presente mas scope.json ilegivel — rede bloqueada")
       }
-      const tool = input?.tool || input?.name
+      const tool = text(input, "tool") || text(input, "name")
+      if (SCOPE_MUTATORS.includes(tool)) {
+        const target = text(record(output)?.args, "filePath") || text(record(output)?.args, "path") || text(record(output)?.args, "file_path")
+        if (/(^|\/)scope\.json$/.test(target)) {
+          audit(dir, tool, target, "block", "scope.json e imutavel pelo agente")
+          throw new Error("scope.json so o dj edita — peça a mudança de escopo em vez de reescrever o arquivo")
+        }
+      }
       if (tool === "bash") {
-        const command = String(output?.args?.command || "")
+        const command = text(record(output)?.args, "command")
         const decision = decideBash(scope, command)
         audit(dir, "bash", command, decision.action, decision.reason)
         if (decision.action === "block") throw new Error(decision.reason)
       }
       if (tool === "webfetch") {
-        const url = String(output?.args?.url || "")
+        const url = text(record(output)?.args, "url")
         const decision = decideUrl(scope, url)
         audit(dir, "webfetch", url, decision.action, decision.reason)
         if (decision.action === "block") throw new Error(decision.reason)
       }
       if (tool === "websearch") {
-        const query = String(output?.args?.query || "")
+        const query = text(record(output)?.args, "query")
         const offenders = extractHosts(query).filter((host: string) => !hostAllowed(scope, host))
         if (offenders.length > 0) {
           audit(dir, "websearch", query, "block", `host fora do escopo: ${offenders.join(", ")}`)

